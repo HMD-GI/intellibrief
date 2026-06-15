@@ -12,39 +12,34 @@ class AllLLMKeysFailedError(RuntimeError):  # 所有 API Key 完整退避后仍�
 
 class LLMRouter:  # 定义 LLM 路由器类
     def __init__(self):  # 初始化方法
-        self.zhipu_keys = settings.zhipu_keys_list  # 智谱的 API Keys
-        self.deepseek_keys = settings.deepseek_keys_list  # DeepSeek 的 API Keys
+        self.filter_llm_keys = settings.filter_llm_keys_list  # 筛选 LLM 的 API Keys
+        self.summary_llm_keys = settings.summary_llm_keys_list  # 摘要 LLM 的 API Keys
         self._key_indexes = {"zhipu": 0, "deepseek": 0}  # 按供应商记录当前轮询到的 Key 下标
         self._response_stats = {}  # 记录各模型最终成功和最终失败次数
-        
-        # 智谱 AI 兼容 OpenAI 接口
-        self.zhipu_base_url = "https://open.bigmodel.cn/api/paas/v4/"  # 智谱接口的基础 URL
-        # DeepSeek 官方兼容 OpenAI 接口
-        self.deepseek_base_url = "https://api.deepseek.com"  # DeepSeek 官方接口基础 URL
 
     def _provider_keys(self, provider: str) -> list[str]:  # 获取供应商对应的 API Key 列表
-        if provider == "zhipu":  # 如果是智谱
-            if not self.zhipu_keys:  # 检查是否配置了 Key
-                raise ValueError("No Zhipu API keys configured.")  # 如果没有则抛出异常
-            return self.zhipu_keys
-        elif provider == "deepseek":  # 如果是 deepseek
-            if not self.deepseek_keys:  # 检查是否配置了 Key
-                raise ValueError("No DeepSeek API keys configured.")  # 如果没有则抛出异常
-            return self.deepseek_keys
+        if provider == "zhipu":  # 筛选 LLM（当前默认 Zhipu）
+            if not self.filter_llm_keys:  # 检查是否配置了 Key
+                raise ValueError("No filter LLM API keys configured.")  # 如果没有则抛出异常
+            return self.filter_llm_keys
+        elif provider == "deepseek":  # 摘要 LLM（当前默认 DeepSeek）
+            if not self.summary_llm_keys:  # 检查是否配置了 Key
+                raise ValueError("No summary LLM API keys configured.")  # 如果没有则抛出异常
+            return self.summary_llm_keys
         raise ValueError(f"Unknown provider: {provider}")  # 提供商未知时抛出异常
 
     def _provider_model(self, provider: str) -> str:  # 获取供应商对应的模型名
-        if provider == "zhipu":
-            return "glm-4.7-flash"
-        if provider == "deepseek":
-            return "deepseek-v4-pro"
+        if provider == "zhipu":  # 筛选 LLM
+            return settings.FILTER_LLM_MODEL
+        if provider == "deepseek":  # 摘要 LLM
+            return settings.SUMMARY_LLM_MODEL
         raise ValueError(f"Unknown provider: {provider}")
 
-    def _provider_base_url(self, provider: str) -> str:  # 获取供应商对应的基础 URL
-        if provider == "zhipu":
-            return self.zhipu_base_url
-        if provider == "deepseek":
-            return self.deepseek_base_url
+    def _provider_base_url(self, provider: str) -> str:  # 获取供应商对应的基础 URL（从 config.py 读取）
+        if provider == "zhipu":  # 筛选 LLM
+            return settings.FILTER_LLM_BASE_URL
+        if provider == "deepseek":  # 摘要 LLM
+            return settings.SUMMARY_LLM_BASE_URL
         raise ValueError(f"Unknown provider: {provider}")
 
     def _get_client(self, provider: str, key: str | None = None) -> tuple[OpenAI, str, str]:  # 获取客户端、模型和当前 Key

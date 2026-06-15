@@ -22,9 +22,18 @@ class Settings(BaseSettings):  # 定义 Settings 类，继承自 BaseSettings
     # Redis 配置
     REDIS_URL: str = "redis://localhost:6379/0"  # Redis 连接 URL，用于 Celery 消息队列和去重缓存
     
-    # LLM (大语言模型) Keys 配置 (逗号分隔支持多 Key)
-    ZHIPU_API_KEYS: str = ""  # 智谱 API Key 列表字符串
-    DEEPSEEK_API_KEYS: str = ""  # 硅基流动/DeepSeek API Key 列表字符串
+    # LLM (大语言模型) 配置
+    # 筛选 LLM（默认智谱 GLM，用于文章筛选+分类）
+    FILTER_LLM_API_KEYS: str = ""  # 筛选 LLM 的 API Key 列表（逗号分隔支持多 Key）
+    #FILTER_LLM_MODEL: str = "glm-4.7-flash"  # 筛选 LLM 的模型名称
+    #FILTER_LLM_BASE_URL: str = "https://open.bigmodel.cn/api/paas/v4/"  # 筛选 LLM 的兼容 OpenAI 接口地址
+    FILTER_LLM_MODEL: str = "deepseek-v4-pro"  # 筛选 LLM 的模型名称
+    FILTER_LLM_BASE_URL: str = "https://api.deepseek.com"  # 筛选 LLM 的兼容 OpenAI 接口地址
+
+    # 摘要 LLM（默认 DeepSeek，用于生成深度摘要）
+    SUMMARY_LLM_API_KEYS: str = ""  # 摘要 LLM 的 API Key 列表（逗号分隔支持多 Key）
+    SUMMARY_LLM_MODEL: str = "deepseek-v4-pro"  # 摘要 LLM 的模型名称
+    SUMMARY_LLM_BASE_URL: str = "https://api.deepseek.com"  # 摘要 LLM 的兼容 OpenAI 接口地址
     
     # 默认信息源配置
     DEFAULT_TOPICS: List[str] = ["大模型", "AI应用"]  # 默认关注的主题列表
@@ -40,12 +49,12 @@ class Settings(BaseSettings):  # 定义 Settings 类，继承自 BaseSettings
         env_file_encoding = "utf-8"  # 指定 .env 文件的编码为 utf-8
 
     @property  # 将方法转换为属性调用
-    def zhipu_keys_list(self) -> List[str]:  # 获取智谱 Key 列表的方法
-        return [k.strip() for k in self.ZHIPU_API_KEYS.split(",") if k.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
+    def filter_llm_keys_list(self) -> List[str]:  # 获取筛选 LLM 的 Key 列表
+        return [k.strip() for k in self.FILTER_LLM_API_KEYS.split(",") if k.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
 
     @property  # 将方法转换为属性调用
-    def deepseek_keys_list(self) -> List[str]:  # 获取 DeepSeek Key 列表的方法
-        return [k.strip() for k in self.DEEPSEEK_API_KEYS.split(",") if k.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
+    def summary_llm_keys_list(self) -> List[str]:  # 获取摘要 LLM 的 Key 列表
+        return [k.strip() for k in self.SUMMARY_LLM_API_KEYS.split(",") if k.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
 
     @property  # 将方法转换为属性调用
     def email_receivers_list(self) -> List[str]:  # 获取收件人邮箱列表的方法
