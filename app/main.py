@@ -5,9 +5,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI  # 导入 FastAPI 核心类
 from fastapi.staticfiles import StaticFiles  # 导入 StaticFiles 用于处理静态文件 (当前未使用可保留)
+from fastapi.middleware.cors import CORSMiddleware  # 导入 CORS 中间件，支持独立前端跨域调用后端 API
 import logging  # 导入 Python 内置的日志模块
 
 from app.database import engine, Base, ensure_sqlite_schema  # 导入数据库引擎和 ORM 基类
+from app.config import settings as app_settings  # 导入应用配置，用于读取前端跨域白名单
 from app.api import briefs, settings, sources, tasks  # 导入各个 API 路由模块
 import app.models  # 导入所有 ORM 模型，确保 create_all 能创建完整表结构
 
@@ -28,6 +30,14 @@ app = FastAPI(  # 实例化 FastAPI 对象
     version="1.0.0"  # 设置 API 版本号
 )
 
+app.add_middleware(  # 添加 CORS 中间件，让独立 Vue 前端可以访问后端 API
+    CORSMiddleware,
+    allow_origins=app_settings.frontend_origins_list,  # 只允许配置中的前端地址跨域访问
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # 运行时自动创建 photo 目录，并挂载为静态资源，便于周报展示图片
 PHOTO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "photo")  # photo 目录的绝对路径
 os.makedirs(PHOTO_DIR, exist_ok=True)  # 若目录不存在则创建
@@ -37,11 +47,6 @@ app.mount("/photo", StaticFiles(directory=PHOTO_DIR), name="photo")  # 将 /phot
 DIGEST_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "digest")  # digest 目录的绝对路径
 os.makedirs(DIGEST_DIR, exist_ok=True)  # 若目录不存在则创建
 app.mount("/digest", StaticFiles(directory=DIGEST_DIR), name="digest")  # 将 /digest 映射到本地 digest 文件夹
-
-# 前后端分离：将纯前端静态资源挂载到 /frontend，便于本地直接访问
-FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")  # frontend 目录的绝对路径
-os.makedirs(FRONTEND_DIR, exist_ok=True)  # 若目录不存在则创建
-app.mount("/frontend", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")  # 将 /frontend 映射到前端目录
 
 # 注册 API 路由
 app.include_router(sources.router)  # 引入 sources 模块下的路由配置

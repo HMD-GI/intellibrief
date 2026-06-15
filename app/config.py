@@ -43,6 +43,7 @@ class Settings(BaseSettings):  # 定义 Settings 类，继承自 BaseSettings
     EMAIL_PASSWORD: str = ""  # 发件人邮箱授权码或密码
     EMAIL_RECEIVERS: str = ""  # 收件人邮箱地址列表（逗号分隔）
     FEISHU_WEBHOOK: str = ""  # 飞书机器人的 Webhook URL
+    FRONTEND_ORIGINS: str = "http://127.0.0.1:5173,http://localhost:5173"  # 独立前端允许跨域访问的地址
 
     class Config:  # 配置内部类
         env_file = ".env"  # 指定环境变量从 .env 文件加载
@@ -59,5 +60,9 @@ class Settings(BaseSettings):  # 定义 Settings 类，继承自 BaseSettings
     @property  # 将方法转换为属性调用
     def email_receivers_list(self) -> List[str]:  # 获取收件人邮箱列表的方法
         return [r.strip() for r in self.EMAIL_RECEIVERS.split(",") if r.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
+
+    @property  # 将方法转换为属性调用
+    def frontend_origins_list(self) -> List[str]:  # 获取前端跨域白名单
+        return [origin.strip() for origin in self.FRONTEND_ORIGINS.split(",") if origin.strip()]  # 按逗号分割并过滤空值
 
 settings = Settings()  # 实例化 Settings 对象，供全局使用
