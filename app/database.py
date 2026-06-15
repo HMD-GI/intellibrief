@@ -48,6 +48,15 @@ def ensure_sqlite_schema():  # 兼容 SQLite 的轻量级自修复 schema 函数
             if "article_date" not in existing_columns:
                 cursor.execute("ALTER TABLE articles ADD COLUMN article_date TEXT")  # 增加文章日期列，格式为 YYYY-MM-DD
 
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='briefs'")  # 检查 briefs 表是否存在
+            briefs_exists = cursor.fetchone() is not None
+            if briefs_exists:
+                cursor.execute("PRAGMA table_info(briefs)")  # 获取 briefs 表列信息
+                brief_columns = {row[1] for row in cursor.fetchall()}
+                if "brief_type" not in brief_columns:
+                    cursor.execute("ALTER TABLE briefs ADD COLUMN brief_type TEXT")  # 增加简报类型列
+                cursor.execute("UPDATE briefs SET brief_type = 'daily' WHERE brief_type IS NULL OR brief_type = ''")  # 兼容历史简报，避免类型筛选漏数据
+
             conn.commit()  # 提交变更
         finally:
             conn.close()  # 关闭连接

@@ -8,7 +8,8 @@ from fastapi.staticfiles import StaticFiles  # 导入 StaticFiles 用于处理�
 import logging  # 导入 Python 内置的日志模块
 
 from app.database import engine, Base, ensure_sqlite_schema  # 导入数据库引擎和 ORM 基类
-from app.api import sources, briefs, tasks  # 导入各个 API 路由模块
+from app.api import briefs, settings, sources, tasks  # 导入各个 API 路由模块
+import app.models  # 导入所有 ORM 模型，确保 create_all 能创建完整表结构
 
 # 初始化日志配置
 logging.basicConfig(  # 调用 basicConfig 设置全局日志格式
@@ -37,10 +38,16 @@ DIGEST_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 os.makedirs(DIGEST_DIR, exist_ok=True)  # 若目录不存在则创建
 app.mount("/digest", StaticFiles(directory=DIGEST_DIR), name="digest")  # 将 /digest 映射到本地 digest 文件夹
 
+# 前后端分离：将纯前端静态资源挂载到 /frontend，便于本地直接访问
+FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")  # frontend 目录的绝对路径
+os.makedirs(FRONTEND_DIR, exist_ok=True)  # 若目录不存在则创建
+app.mount("/frontend", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")  # 将 /frontend 映射到前端目录
+
 # 注册 API 路由
 app.include_router(sources.router)  # 引入 sources 模块下的路由配置
 app.include_router(briefs.router)  # 引入 briefs 模块下的路由配置
 app.include_router(tasks.router)  # 引入 tasks 模块下的路由配置
+app.include_router(settings.router)  # 引入 settings 模块下的路由配置
 
 @app.get("/")  # 注册根路径的 GET 请求路由
 def root():  # 定义根路径的处理函数

@@ -5,20 +5,41 @@ import requests  # 导入 requests 发送 HTTP 请求
 import logging  # 导入日志
 from datetime import date  # 导入 date
 from app.config import settings  # 导入配置
+from app.database import SessionLocal  # 导入数据库会话
+from app.models.setting import AppSetting  # 导入设置模型
+import json  # 导入 JSON
 
 logger = logging.getLogger(__name__)  # 初始化日志
 
+def _load_binding_settings() -> dict:  # 读取前端保存的绑定配置
+    db = SessionLocal()
+    try:
+        row = db.query(AppSetting).filter(AppSetting.key == "bindings").first()
+        return json.loads(row.value) if row and row.value else {}
+    except Exception as e:
+        logger.error(f"load binding settings failed: {e}")
+        return {}
+    finally:
+        db.close()
+
 def send_email(html_content: str, brief_date: date):  # 定义邮件推送函数
-    if not settings.EMAIL_SENDER or not settings.EMAIL_PASSWORD:  # 检查邮箱配置是否齐全
+    bindings = _load_binding_settings()  # 优先读取前端绑定配置
+    email_binding = bindings.get("email", {}) if bindings else {}
+    sender = email_binding.get("sender") or settings.EMAIL_SENDER
+    password = email_binding.get("password") or settings.EMAIL_PASSWORD
+    receivers = email_binding.get("receivers") or settings.email_receivers_list
+    if isinstance(receivers, str):
+        receivers = [item.strip() for item in receivers.split(",") if item.strip()]
+
+    if not sender or not password:  # 检查邮箱配置是否齐全
         logger.warning("Email configuration missing, skip sending.")  # 若缺失则警告并跳过
         return
         
-    receivers = settings.email_receivers_list  # 获取收件人列表
     if not receivers:  # 如果收件人为空
         return  # 跳过
         
     msg = MIMEMultipart()  # 实例化复合邮件对象
-    msg['From'] = settings.EMAIL_SENDER  # 设置发件人
+    msg['From'] = sender  # 设置发件人
     msg['To'] = ", ".join(receivers)  # 设置收件人字符串
     msg['Subject'] = f"IntelliBrief 每日简报 - {brief_date.strftime('%Y-%m-%d')}"  # 设置邮件主题
     
@@ -27,15 +48,18 @@ def send_email(html_content: str, brief_date: date):  # 定义邮件推送函数
     try:
         # 这里以 QQ 邮箱的 SMTP 服务器为例，实际可根据配置更改主机和端口
         server = smtplib.SMTP_SSL("smtp.qq.com", 465)  # 建立 SSL 连接
-        server.login(settings.EMAIL_SENDER, settings.EMAIL_PASSWORD)  # 登录发件邮箱
-        server.sendmail(settings.EMAIL_SENDER, receivers, msg.as_string())  # 发送邮件
+        server.login(sender, password)  # 登录发件邮箱
+        server.sendmail(sender, receivers, msg.as_string())  # 发送邮件
         server.quit()  # 退出 SMTP 服务器
         logger.info(f"Brief email sent for {brief_date}")  # 记录成功日志
     except Exception as e:
         logger.error(f"Failed to send email: {e}")  # 记录异常日志
 
 def send_webhook(brief_url: str):  # 定义 Webhook 推送函数（以飞书为例）
-    if not settings.FEISHU_WEBHOOK:  # 检查飞书 Webhook 是否配置
+    bindings = _load_binding_settings()  # 优先读取前端绑定配置
+    feishu_binding = bindings.get("feishu", {}) if bindings else {}
+    webhook = feishu_binding.get("webhook") or settings.FEISHU_WEBHOOK
+    if not webhook:  # 检查飞书 Webhook 是否配置
         logger.warning("Feishu webhook not configured, skip sending.")  # 缺失则跳过
         return
         
@@ -65,7 +89,7 @@ def send_webhook(brief_url: str):  # 定义 Webhook 推送函数（以飞书为�
     }
     
     try:
-        resp = requests.post(settings.FEISHU_WEBHOOK, json=payload, timeout=10)  # 发送 POST 请求到 Webhook 地址
+        resp = requests.post(webhook, json=payload, timeout=10)  # 发送 POST 请求到 Webhook 地址
         resp.raise_for_status()  # 检查 HTTP 状态码
         logger.info("Feishu webhook sent.")  # 记录成功日志
     except Exception as e:

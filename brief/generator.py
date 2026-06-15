@@ -96,6 +96,7 @@ def generate_daily_brief(brief_date: date) -> Brief:  # 定义生成每日简报
         brief = Brief(  # 构建简报 ORM 实例
             date=brief_date,  # 设置日期
             title=f"IntelliBrief 每日简报 - {brief_date.strftime('%Y-%m-%d')}",  # 设置标题
+            brief_type="daily",  # 设置简报类型，便于前端筛选
             html_content=html_content,  # 存入渲染后的 HTML
             article_ids=article_ids  # 存入关联的文章 ID
         )
