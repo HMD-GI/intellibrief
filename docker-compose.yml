@@ -1,0 +1,52 @@
+version: '3.8'
+# 指定 Docker Compose 文件格式版本
+
+services:
+  # 定义 Redis 服务，用于 Celery 消息队列和数据去重
+  redis:
+    image: redis:6-alpine # 使用轻量级 Redis 镜像
+    ports:
+      - "6379:6379" # 映射宿主机和容器端口
+    volumes:
+      - redis_data:/data # 持久化 Redis 数据
+
+  # 定义 FastAPI Web 后端服务
+  web:
+    build: . # 根据当前目录的 Dockerfile 构建镜像
+    ports:
+      - "8000:8000" # 映射 8000 端口
+    env_file:
+      - .env # 加载环境变量文件
+    volumes:
+      - .:/app # 挂载当前目录，便于开发热重载
+    depends_on:
+      - redis # 依赖 Redis 服务先启动
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload # 启动命令
+
+  # 定义 Celery 任务执行节点
+  celery_worker:
+    build: . # 共用项目镜像
+    env_file:
+      - .env # 环境变量
+    volumes:
+      - .:/app # 代码挂载
+    depends_on:
+      - redis # 依赖 Redis
+    # 启动 Celery Worker，使用 gevent 协程池以提高 I/O 密集型任务并发能力
+    command: celery -A scheduler.celery_app worker -l info -P gevent
+
+  # 定义 Celery 定时调度器
+  celery_beat:
+    build: . # 共用项目镜像
+    env_file:
+      - .env # 环境变量
+    volumes:
+      - .:/app # 代码挂载
+    depends_on:
+      - redis # 依赖 Redis
+    # 启动 Celery Beat 定时调度服务
+    command: celery -A scheduler.celery_app beat -l info
+
+# 声明数据卷
+volumes:
+  redis_data: # 用于 Redis 持久化的具名数据卷
