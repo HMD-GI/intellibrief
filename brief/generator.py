@@ -7,6 +7,7 @@ from jinja2 import Environment, FileSystemLoader  # 导入 Jinja2 模板引擎
 from app.database import SessionLocal  # 导入数据库会话工厂
 from app.models.article import Article, ArticleStatus  # 导入文章模型
 from app.models.brief import Brief  # 导入简报模型
+from app.models.source import Source  # 导入数据源模型，用于按源主题筛选文章
 
 logger = logging.getLogger(__name__)  # 初始化日志
 DIGEST_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "digest")  # 简报文件输出目录
@@ -45,33 +46,40 @@ def _build_image_map(date_str: str) -> dict[int, str]:  # 根据 photo/<日期>/
         image_map[int(stem)] = f"/photo/{date_str}/{filename}"
     return image_map
 
-def _save_digest_file(brief_date: date, html_content: str) -> str:  # 将生成的简报 HTML 保存到 digest 目录
+def _safe_topic_filename(topic: str) -> str:  # 生成适合文件名使用的主题文本
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in (topic or "综合"))  # 替换文件名非法字符
+    return safe.strip("_") or "综合"
+
+def _save_digest_file(brief_date: date, html_content: str, topic: str = "综合") -> str:  # 将生成的简报 HTML 保存到 digest 目录
     os.makedirs(DIGEST_DIR, exist_ok=True)  # 确保 digest 目录存在
-    file_path = os.path.join(DIGEST_DIR, f"brief_{brief_date.strftime('%Y-%m-%d')}.html")
+    topic_name = _safe_topic_filename(topic)  # 将主题转换为安全文件名
+    file_path = os.path.join(DIGEST_DIR, f"brief_{brief_date.strftime('%Y-%m-%d')}_{topic_name}.html")
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(html_content)
     return file_path
 
-def generate_daily_brief(brief_date: date) -> Brief:  # 定义生成每日简报函数
+def generate_daily_brief(brief_date: date, topic: str = "综合") -> Brief:  # 定义生成每日简报函数
     db = SessionLocal()  # 获取数据库会话
     try:
-        # 检查是否已生成当天的简报
-        existing_brief = db.query(Brief).filter(Brief.date == brief_date).first()
+        topic = (topic or "综合").strip()  # 规范化主题
+        # 检查是否已生成当天同主题的简报
+        existing_brief = db.query(Brief).filter(Brief.date == brief_date, Brief.topic == topic).first()
         if existing_brief:
-            logger.info(f"Brief for {brief_date} already exists.")  # 记录已存在日志
+            logger.info(f"Brief for {brief_date} topic {topic} already exists.")  # 记录已存在日志
             if existing_brief.html_content:
-                _save_digest_file(brief_date, existing_brief.html_content)  # 已存在记录也同步落盘到 digest
+                _save_digest_file(brief_date, existing_brief.html_content, topic)  # 已存在记录也同步落盘到 digest
             return existing_brief  # 直接返回现有简报
             
-        # 查询当天处理完成且分数及格 (>=60) 的高质量文章
+        # 查询当天处理完成、分数及格且来源主题匹配的高质量文章
         articles = db.query(Article).filter(
             Article.status == ArticleStatus.processed,
             Article.quality_score >= 60,
-            Article.article_date == brief_date.strftime("%Y-%m-%d")
+            Article.article_date == brief_date.strftime("%Y-%m-%d"),
+            Article.source.has(Source.topics == topic)
         ).all()
         
         if not articles:  # 如果没有满足条件的文章
-            logger.info("No articles to generate brief.")  # 记录日志
+            logger.info(f"No articles to generate brief for topic {topic}.")  # 记录日志
             return None  # 返回空
             
         article_ids = []  # 初始化文章 ID 列表
@@ -86,8 +94,8 @@ def generate_daily_brief(brief_date: date) -> Brief:  # 定义生成每日简报
         html_content = template.render(  # 传入数据渲染模板
             date=brief_date.strftime("%Y-%m-%d"),  # 兼容旧变量
             date_label=brief_date.strftime("%Y-%m-%d"),  # 新变量：日期展示
-            report_title="IntelliBrief 每日简报",  # 报告标题
-            subtitle="测试模式：每次只抓取少量文章并支持配图展示",  # 子标题
+            report_title=f"IntelliBrief {topic}每日简报",  # 报告标题
+            subtitle=f"主题：{topic}",  # 子标题
             grouped_articles=grouped_articles,  # 传入分组后的文章
             image_map=image_map,  # 传入图片编号映射（按编号匹配文章图片）
             total_count=len(articles)  # 传入总文章数
@@ -95,7 +103,8 @@ def generate_daily_brief(brief_date: date) -> Brief:  # 定义生成每日简报
         
         brief = Brief(  # 构建简报 ORM 实例
             date=brief_date,  # 设置日期
-            title=f"IntelliBrief 每日简报 - {brief_date.strftime('%Y-%m-%d')}",  # 设置标题
+            title=f"IntelliBrief {topic}每日简报 - {brief_date.strftime('%Y-%m-%d')}",  # 设置标题
+            topic=topic,  # 设置简报主题
             brief_type="daily",  # 设置简报类型，便于前端筛选
             html_content=html_content,  # 存入渲染后的 HTML
             article_ids=article_ids  # 存入关联的文章 ID
@@ -103,7 +112,7 @@ def generate_daily_brief(brief_date: date) -> Brief:  # 定义生成每日简报
         db.add(brief)  # 添加到会话
         db.commit()  # 提交事务
         db.refresh(brief)  # 刷新获取对象 ID
-        _save_digest_file(brief_date, html_content)  # 将简报 HTML 文件保存到 digest 目录
+        _save_digest_file(brief_date, html_content, topic)  # 将简报 HTML 文件保存到 digest 目录
         return brief  # 返回简报对象
     except Exception as e:
         logger.error(f"Error generating brief: {e}")  # 记录异常
@@ -111,3 +120,11 @@ def generate_daily_brief(brief_date: date) -> Brief:  # 定义生成每日简报
         return None
     finally:
         db.close()  # 关闭会话
+
+def generate_daily_briefs(brief_date: date, topics: list[str]) -> list[Brief]:  # 按主题批量生成每日简报
+    briefs = []  # 保存生成结果
+    for topic in topics:
+        brief = generate_daily_brief(brief_date, topic)  # 每个主题生成一份简报
+        if brief:
+            briefs.append(brief)
+    return briefs

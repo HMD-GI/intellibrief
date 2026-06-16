@@ -1,5 +1,6 @@
 import logging  # 导入日志模块
 import time  # 导入 time 用于等待
+from threading import RLock  # 导入可重入锁，保证多线程调用时轮询索引和统计安全
 from openai import OpenAI, RateLimitError  # 导入 OpenAI 官方 SDK 客户端和限流异常
 from app.config import settings  # 导入配置
 
@@ -12,34 +13,39 @@ class AllLLMKeysFailedError(RuntimeError):  # 所有 API Key 完整退避后仍�
 
 class LLMRouter:  # 定义 LLM 路由器类
     def __init__(self):  # 初始化方法
-        self.filter_llm_keys = settings.filter_llm_keys_list  # 筛选 LLM 的 API Keys
-        self.summary_llm_keys = settings.summary_llm_keys_list  # 摘要 LLM 的 API Keys
-        self._key_indexes = {"zhipu": 0, "deepseek": 0}  # 按供应商记录当前轮询到的 Key 下标
+        self._key_indexes = {"first": 0, "second": 0, "third": 0}  # 按处理步骤记录当前轮询到的 Key 下标
         self._response_stats = {}  # 记录各模型最终成功和最终失败次数
+        self._lock = RLock()  # 多线程并发调用大模型时保护共享状态
 
-    def _provider_keys(self, provider: str) -> list[str]:  # 获取供应商对应的 API Key 列表
-        if provider == "zhipu":  # 筛选 LLM（当前默认 Zhipu）
-            if not self.filter_llm_keys:  # 检查是否配置了 Key
-                raise ValueError("No filter LLM API keys configured.")  # 如果没有则抛出异常
-            return self.filter_llm_keys
-        elif provider == "deepseek":  # 摘要 LLM（当前默认 DeepSeek）
-            if not self.summary_llm_keys:  # 检查是否配置了 Key
-                raise ValueError("No summary LLM API keys configured.")  # 如果没有则抛出异常
-            return self.summary_llm_keys
+    def _provider_keys(self, provider: str) -> list[str]:  # 获取处理步骤对应的 API Key 列表
+        if provider == "first":  # 第一步筛选 LLM
+            keys = settings.first_llm_keys_list
+        elif provider == "second":  # 第二步摘要 LLM
+            keys = settings.second_llm_keys_list
+        elif provider == "third":  # 第三步分类 LLM
+            keys = settings.third_llm_keys_list
+        else:
+            raise ValueError(f"Unknown provider: {provider}")  # 提供商未知时抛出异常
+        if not keys:  # 检查是否配置了 Key
+            raise ValueError(f"No {provider} LLM API keys configured.")  # 如果没有则抛出异常
+        return keys
+
+    def _provider_model(self, provider: str) -> str:  # 获取处理步骤对应的模型名
+        if provider == "first":  # 第一步筛选 LLM
+            return settings.FIRST_LLM_MODEL
+        if provider == "second":  # 第二步摘要 LLM
+            return settings.SECOND_LLM_MODEL
+        if provider == "third":  # 第三步分类 LLM
+            return settings.THIRD_LLM_MODEL
         raise ValueError(f"Unknown provider: {provider}")  # 提供商未知时抛出异常
 
-    def _provider_model(self, provider: str) -> str:  # 获取供应商对应的模型名
-        if provider == "zhipu":  # 筛选 LLM
-            return settings.FILTER_LLM_MODEL
-        if provider == "deepseek":  # 摘要 LLM
-            return settings.SUMMARY_LLM_MODEL
-        raise ValueError(f"Unknown provider: {provider}")
-
-    def _provider_base_url(self, provider: str) -> str:  # 获取供应商对应的基础 URL（从 config.py 读取）
-        if provider == "zhipu":  # 筛选 LLM
-            return settings.FILTER_LLM_BASE_URL
-        if provider == "deepseek":  # 摘要 LLM
-            return settings.SUMMARY_LLM_BASE_URL
+    def _provider_base_url(self, provider: str) -> str:  # 获取处理步骤对应的基础 URL（从 config.py 读取）
+        if provider == "first":  # 第一步筛选 LLM
+            return settings.FIRST_LLM_BASE_URL
+        if provider == "second":  # 第二步摘要 LLM
+            return settings.SECOND_LLM_BASE_URL
+        if provider == "third":  # 第三步分类 LLM
+            return settings.THIRD_LLM_BASE_URL
         raise ValueError(f"Unknown provider: {provider}")
 
     def _get_client(self, provider: str, key: str | None = None) -> tuple[OpenAI, str, str]:  # 获取客户端、模型和当前 Key
@@ -50,37 +56,45 @@ class LLMRouter:  # 定义 LLM 路由器类
         return client, model, key  # 返回客户端实例、模型名称和当前 Key
 
     def _current_key(self, provider: str, keys: list[str]) -> str:  # 获取当前轮询 Key
-        index = self._key_indexes.get(provider, 0) % len(keys)
-        return keys[index]
+        with self._lock:
+            index = self._key_indexes.get(provider, 0) % len(keys)
+            return keys[index]
 
-    def _advance_key(self, provider: str, keys: list[str]) -> None:  # 成功调用后切换到下一个 Key
-        index = self._key_indexes.get(provider, 0) % len(keys)
-        self._key_indexes[provider] = (index + 1) % len(keys)
+    def _advance_key(self, provider: str, keys: list[str], api_key: str) -> None:  # 成功调用后切换到当前成功 Key 的下一个 Key
+        with self._lock:
+            index = keys.index(api_key) if api_key in keys else self._key_indexes.get(provider, 0) % len(keys)
+            self._key_indexes[provider] = (index + 1) % len(keys)
 
     def _set_key_index(self, provider: str, key: str) -> None:  # 将轮询指针设置到指定 Key
         keys = self._provider_keys(provider)
-        self._key_indexes[provider] = keys.index(key)
+        with self._lock:
+            self._key_indexes[provider] = keys.index(key)
 
     def _ordered_keys_from_current(self, provider: str) -> list[str]:  # 从当前 Key 开始按轮询顺序返回所有 Key
         keys = self._provider_keys(provider)
-        start = self._key_indexes.get(provider, 0) % len(keys)
+        with self._lock:
+            start = self._key_indexes.get(provider, 0) % len(keys)
         return keys[start:] + keys[:start]
 
     def _mask_key(self, api_key: str) -> str:  # 只展示 API Key 前 4 位
         return f"{(api_key or '')[:4]}...."
 
     def _record_response(self, model: str, success: bool) -> None:  # 记录模型最终响应结果
-        if model not in self._response_stats:
-            self._response_stats[model] = {"success": 0, "failure": 0}
-        field = "success" if success else "failure"
-        self._response_stats[model][field] += 1
+        with self._lock:
+            if model not in self._response_stats:
+                self._response_stats[model] = {"success": 0, "failure": 0}
+            field = "success" if success else "failure"
+            self._response_stats[model][field] += 1
 
     def log_response_stats(self) -> None:  # 输出大模型最终响应统计
-        for model, stats in self._response_stats.items():
+        with self._lock:
+            stats_snapshot = dict(self._response_stats)
+        for model, stats in stats_snapshot.items():
             logger.info(f"{model}模型响应成功{stats['success']}次，响应失败{stats['failure']}次")
 
     def reset_response_stats(self) -> None:  # 清空本轮运行的大模型响应统计
-        self._response_stats = {}
+        with self._lock:
+            self._response_stats = {}
 
     def _call_with_key(self, provider: str, api_key: str, messages: list, max_retries: int, response_format: dict = None) -> str:  # 使用单个 Key 完成完整退避流程
         client, model, api_key = self._get_client(provider, api_key)  # 固定当前 Key，失败期间不切换 Key
@@ -98,7 +112,7 @@ class LLMRouter:  # 定义 LLM 路由器类
                     kwargs["response_format"] = response_format  # 加入到参数中
 
                 response = client.chat.completions.create(**kwargs)  # 发起 API 调用
-                self._advance_key(provider, self._provider_keys(provider))  # 成功返回后切换到下一个 Key
+                self._advance_key(provider, self._provider_keys(provider), api_key)  # 成功返回后切换到当前成功 Key 的下一个 Key
                 self._record_response(model, True)  # 记录最终成功响应
                 return response.choices[0].message.content  # 返回模型回复的内容文本
 
@@ -124,7 +138,6 @@ class LLMRouter:  # 定义 LLM 路由器类
         last_error = None
 
         for api_key in keys:
-            self._set_key_index(provider, api_key)  # 当前 Key 失败期间保持不切换
             try:
                 return self._call_with_key(provider, api_key, messages, max_retries, response_format)
             except Exception as e:

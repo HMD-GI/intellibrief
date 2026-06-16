@@ -28,6 +28,7 @@ def query_briefs(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
     brief_type: Optional[str] = Query(None),
+    topic: Optional[str] = Query(None),
     skip: int = 0,
     limit: int = 30,
     db: Session = Depends(get_db),
@@ -39,6 +40,8 @@ def query_briefs(
         query = query.filter(Brief.date <= end_date)
     if brief_type and brief_type != "all":
         query = query.filter(Brief.brief_type == brief_type)  # 根据简报类型筛选
+    if topic and topic != "all":
+        query = query.filter(Brief.topic == topic)  # 根据主题筛选
 
     total = query.count()
     briefs = query.order_by(Brief.date.desc()).offset(skip).limit(limit).all()
@@ -50,10 +53,45 @@ def query_briefs(
             "generated_at": brief.generated_at.isoformat() if brief.generated_at else None,
             "article_count": len(brief.article_ids or []),
             "type": brief.brief_type or "daily",
+            "topic": brief.topic or "综合",
         }
         for brief in briefs
     ]
     return ok({"items": items, "total": total})
+
+@router.get("/item/{brief_id}/content")  # 注册按 ID 查看简报详情接口
+def read_brief_content_by_id(brief_id: int, db: Session = Depends(get_db)):  # 返回统一 JSON 响应
+    brief = db.query(Brief).filter(Brief.id == brief_id).first()
+    if not brief:
+        raise HTTPException(status_code=404, detail="Brief not found")
+    return ok(
+        {
+            "id": brief.id,
+            "date": brief.date.isoformat(),
+            "title": brief.title,
+            "topic": brief.topic or "综合",
+            "html_content": brief.html_content,
+            "article_ids": brief.article_ids or [],
+            "type": brief.brief_type or "daily",
+            "generated_at": brief.generated_at.isoformat() if brief.generated_at else None,
+        }
+    )
+
+@router.get("/item/{brief_id}/html", response_class=HTMLResponse)  # 注册按 ID 获取简报 HTML 的接口
+def read_brief_html_by_id(brief_id: int, db: Session = Depends(get_db)):  # 根据 ID 返回简报 HTML
+    brief = db.query(Brief).filter(Brief.id == brief_id).first()
+    if not brief:
+        raise HTTPException(status_code=404, detail="Brief not found")
+    return brief.html_content
+
+@router.delete("/item/{brief_id}")  # 注册按 ID 删除简报接口
+def delete_brief_by_id(brief_id: int, db: Session = Depends(get_db)):  # 删除指定 ID 简报
+    brief = db.query(Brief).filter(Brief.id == brief_id).first()
+    if not brief:
+        raise HTTPException(status_code=404, detail="Brief not found")
+    db.delete(brief)
+    db.commit()
+    return ok(True, "deleted")
 
 @router.get("/{brief_date}/content")  # 注册前端查看简报详情接口
 def read_brief_content(brief_date: date, db: Session = Depends(get_db)):  # 返回统一 JSON 响应
@@ -65,6 +103,7 @@ def read_brief_content(brief_date: date, db: Session = Depends(get_db)):  # 返�
             "id": brief.id,
             "date": brief.date.isoformat(),
             "title": brief.title,
+            "topic": brief.topic or "综合",
             "html_content": brief.html_content,
             "article_ids": brief.article_ids or [],
             "type": brief.brief_type or "daily",

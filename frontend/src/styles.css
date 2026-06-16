@@ -184,6 +184,13 @@ select {
   background: var(--brand-hover);
 }
 
+.primary-btn:disabled,
+.secondary-btn:disabled,
+.danger-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
 .secondary-btn {
   background: #fff;
   color: var(--text);
@@ -216,6 +223,8 @@ select {
 
 .schedule-row {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin: 14px 0 8px;
 }
@@ -236,9 +245,21 @@ select {
   background: #fff;
 }
 
+.check-row {
+  display: flex;
+  grid-template-columns: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.check-row input {
+  width: 16px;
+  height: 16px;
+}
+
 .filter-bar {
   display: grid;
-  grid-template-columns: repeat(3, minmax(160px, 1fr)) auto;
+  grid-template-columns: repeat(4, minmax(150px, 1fr)) auto;
   align-items: end;
   gap: 12px;
   margin-bottom: 14px;
@@ -252,7 +273,7 @@ select {
 
 .table-row {
   display: grid;
-  grid-template-columns: 140px 1fr 110px 170px;
+  grid-template-columns: 130px 1fr 120px 110px 170px;
   align-items: center;
   gap: 12px;
   padding: 12px 14px;
@@ -338,4 +359,9 @@ select {
   display: flex;
   gap: 10px;
   justify-content: flex-end;
+}
+
+.schedule-topic {
+  color: var(--muted);
+  font-size: 12px;
 }

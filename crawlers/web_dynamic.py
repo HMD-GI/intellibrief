@@ -1,11 +1,13 @@
 from typing import List  # 导入 List
-from datetime import datetime  # 导入 datetime
+from datetime import date  # 导入 date
 from crawlers.base import BaseCrawler, RawArticle  # 导入基类
 import logging  # 导入日志
 import asyncio  # 导入 asyncio 库处理异步
 from playwright.async_api import async_playwright  # 导入 Playwright 异步 API
 from bs4 import BeautifulSoup  # 导入 BeautifulSoup
 from urllib.parse import urljoin  # 导入 urljoin
+from app.config import get_source_xpath_config  # 导入源专属 XPath 配置读取函数
+from crawlers.web_static import _extract_article_datetime, _extract_article_image_url  # 复用静态爬虫的详情页日期和图片提取逻辑
 
 logger = logging.getLogger(__name__)  # 初始化日志
 
@@ -23,8 +25,11 @@ class DynamicCrawler(BaseCrawler):  # 动态网页爬虫类
         config = self.source.parser_config or {}  # 获取配置
         list_selector = config.get("list_selector")  # 获取列表选择器
         link_selector = config.get("link_selector", "a")  # 获取链接选择器
-        max_articles = config.get("max_articles", 5)  # 默认最多抓取 5 篇
         max_failures = config.get("max_failures", 10)  # 最大连续失败次数
+        xpath_config = get_source_xpath_config(self.source.url)  # 获取当前来源专属 XPath 配置
+        article_date_xpath = config.get("article_date_xpath") or xpath_config.get("article_date_xpath")  # 获取文章日期 XPath
+        article_image_xpath = config.get("article_image_xpath") or xpath_config.get("article_image_xpath")  # 获取文章图片 XPath
+        today_str = date.today().isoformat()  # 当天日期字符串，用于过滤文章
         
         if not list_selector:  # 缺少列表选择器
             logger.error(f"No list_selector for source {self.source.name}")  # 报错
@@ -51,8 +56,8 @@ class DynamicCrawler(BaseCrawler):  # 动态网页爬虫类
                 content = await page.content()  # 获取渲染后的完整 HTML 源码
                 soup = BeautifulSoup(content, 'html.parser')  # 解析 HTML
                 
-                items = soup.select(list_selector)[:max_articles]  # 查找列表条目并限制数量
-                logger.info(f"Found {len(items)} items (limited to {max_articles})")
+                items = soup.select(list_selector)  # 查找列表页全部条目，后续按详情页日期过滤
+                logger.info(f"Found {len(items)} items")
                 
                 fetch_detail = config.get("fetch_detail", True)  # 是否抓取详情页
                 consecutive_failures = 0  # 连续失败计数器
@@ -99,13 +104,25 @@ class DynamicCrawler(BaseCrawler):  # 动态网页爬虫类
                         else:
                             raw_html = content  # 使用列表页内容
                             consecutive_failures = 0  # 不抓取详情页时不算失败
+
+                        published_at = _extract_article_datetime(raw_html, article_date_xpath) if raw_html else None  # 从详情页解析发布时间
+                        if not published_at:
+                            logger.info(f"Skip article without parsable date: {url}")
+                            continue
+                        article_date = published_at.date().isoformat()
+                        if article_date != today_str:
+                            logger.info(f"Skip non-today article {article_date}: {url}")
+                            continue
+                        image_url = _extract_article_image_url(raw_html, article_image_xpath, url) if raw_html else None  # 提取源专属图片 URL
                             
                         results.append(RawArticle(  # 添加结果
                             url=url,  # 传入 URL
                             title=title,  # 传入标题
                             raw_html=raw_html,  # 传入 HTML
-                            published_date=datetime.utcnow(),  # 当前时间
-                            source_id=self.source.id  # 源 ID
+                            published_date=published_at,  # 保存详情页发布时间
+                            source_id=self.source.id,  # 源 ID
+                            article_date=article_date,  # 保存 YYYY-MM-DD 格式文章日期
+                            image_url=image_url  # 保存详情页图片 URL
                         ))
                     except Exception as e:
                         logger.error(f"[{idx+1}/{len(items)}] Unexpected error processing item: {str(e)[:200]}")

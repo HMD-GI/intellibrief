@@ -53,6 +53,7 @@ app.include_router(sources.router)  # 引入 sources 模块下的路由配置
 app.include_router(briefs.router)  # 引入 briefs 模块下的路由配置
 app.include_router(tasks.router)  # 引入 tasks 模块下的路由配置
 app.include_router(settings.router)  # 引入 settings 模块下的路由配置
+tasks.restore_schedule_timer()  # 后端启动时恢复前端已开启的定时生成配置
 
 @app.get("/")  # 注册根路径的 GET 请求路由
 def root():  # 定义根路径的处理函数

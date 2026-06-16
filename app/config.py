@@ -22,18 +22,18 @@ class Settings(BaseSettings):  # 定义 Settings 类，继承自 BaseSettings
     # Redis 配置
     REDIS_URL: str = "redis://localhost:6379/0"  # Redis 连接 URL，用于 Celery 消息队列和去重缓存
     
-    # LLM (大语言模型) 配置
-    # 筛选 LLM（默认智谱 GLM，用于文章筛选+分类）
-    FILTER_LLM_API_KEYS: str = ""  # 筛选 LLM 的 API Key 列表（逗号分隔支持多 Key）
-    #FILTER_LLM_MODEL: str = "glm-4.7-flash"  # 筛选 LLM 的模型名称
-    #FILTER_LLM_BASE_URL: str = "https://open.bigmodel.cn/api/paas/v4/"  # 筛选 LLM 的兼容 OpenAI 接口地址
-    FILTER_LLM_MODEL: str = "deepseek-v4-pro"  # 筛选 LLM 的模型名称
-    FILTER_LLM_BASE_URL: str = "https://api.deepseek.com"  # 筛选 LLM 的兼容 OpenAI 接口地址
+    # LLM (大语言模型) 配置：按处理步骤命名，避免在代码中写死厂商名
+    FIRST_LLM_API_KEYS: str = ""  # 第一步筛选模型 API Key 列表（逗号分隔支持多 Key）
+    FIRST_LLM_MODEL: str = "deepseek-v4-pro"  # 第一步筛选模型名称
+    FIRST_LLM_BASE_URL: str = "https://api.deepseek.com"  # 第一步筛选模型兼容 OpenAI 接口地址
 
-    # 摘要 LLM（默认 DeepSeek，用于生成深度摘要）
-    SUMMARY_LLM_API_KEYS: str = ""  # 摘要 LLM 的 API Key 列表（逗号分隔支持多 Key）
-    SUMMARY_LLM_MODEL: str = "deepseek-v4-pro"  # 摘要 LLM 的模型名称
-    SUMMARY_LLM_BASE_URL: str = "https://api.deepseek.com"  # 摘要 LLM 的兼容 OpenAI 接口地址
+    SECOND_LLM_API_KEYS: str = ""  # 第二步摘要模型 API Key 列表（逗号分隔支持多 Key）
+    SECOND_LLM_MODEL: str = "deepseek-v4-pro"  # 第二步摘要模型名称
+    SECOND_LLM_BASE_URL: str = "https://api.deepseek.com"  # 第二步摘要模型兼容 OpenAI 接口地址
+
+    THIRD_LLM_API_KEYS: str = ""  # 第三步分类模型 API Key 列表（逗号分隔支持多 Key）
+    THIRD_LLM_MODEL: str = "deepseek-v4-pro"  # 第三步分类模型名称
+    THIRD_LLM_BASE_URL: str = "https://api.deepseek.com"  # 第三步分类模型兼容 OpenAI 接口地址
     
     # 默认信息源配置
     DEFAULT_TOPICS: List[str] = ["大模型", "AI应用"]  # 默认关注的主题列表
@@ -42,20 +42,28 @@ class Settings(BaseSettings):  # 定义 Settings 类，继承自 BaseSettings
     EMAIL_SENDER: str = ""  # 发件人邮箱地址
     EMAIL_PASSWORD: str = ""  # 发件人邮箱授权码或密码
     EMAIL_RECEIVERS: str = ""  # 收件人邮箱地址列表（逗号分隔）
+    EMAIL_SMTP_HOST: str = "smtp.qq.com"  # SMTP 服务器地址，可被前端绑定配置覆盖
+    EMAIL_SMTP_PORT: int = 465  # SMTP 服务器端口，可被前端绑定配置覆盖
+    EMAIL_SMTP_USE_SSL: bool = True  # 是否使用 SMTP_SSL，可被前端绑定配置覆盖
     FEISHU_WEBHOOK: str = ""  # 飞书机器人的 Webhook URL
     FRONTEND_ORIGINS: str = "http://127.0.0.1:5173,http://localhost:5173"  # 独立前端允许跨域访问的地址
 
     class Config:  # 配置内部类
         env_file = ".env"  # 指定环境变量从 .env 文件加载
         env_file_encoding = "utf-8"  # 指定 .env 文件的编码为 utf-8
+        extra = "ignore"  # 忽略 .env 中已废弃的旧配置字段，避免启动报错
 
     @property  # 将方法转换为属性调用
-    def filter_llm_keys_list(self) -> List[str]:  # 获取筛选 LLM 的 Key 列表
-        return [k.strip() for k in self.FILTER_LLM_API_KEYS.split(",") if k.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
+    def first_llm_keys_list(self) -> List[str]:  # 获取第一步 LLM 的 Key 列表
+        return [k.strip() for k in self.FIRST_LLM_API_KEYS.split(",") if k.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
 
     @property  # 将方法转换为属性调用
-    def summary_llm_keys_list(self) -> List[str]:  # 获取摘要 LLM 的 Key 列表
-        return [k.strip() for k in self.SUMMARY_LLM_API_KEYS.split(",") if k.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
+    def second_llm_keys_list(self) -> List[str]:  # 获取第二步 LLM 的 Key 列表
+        return [k.strip() for k in self.SECOND_LLM_API_KEYS.split(",") if k.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
+
+    @property  # 将方法转换为属性调用
+    def third_llm_keys_list(self) -> List[str]:  # 获取第三步 LLM 的 Key 列表
+        return [k.strip() for k in self.THIRD_LLM_API_KEYS.split(",") if k.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
 
     @property  # 将方法转换为属性调用
     def email_receivers_list(self) -> List[str]:  # 获取收件人邮箱列表的方法

@@ -28,10 +28,15 @@ def send_email(html_content: str, brief_date: date):  # 定义邮件推送函数
     sender = email_binding.get("sender") or settings.EMAIL_SENDER
     password = email_binding.get("password") or settings.EMAIL_PASSWORD
     receivers = email_binding.get("receivers") or settings.email_receivers_list
+    smtp_host = email_binding.get("smtp_host") or settings.EMAIL_SMTP_HOST
+    smtp_port = int(email_binding.get("smtp_port") or settings.EMAIL_SMTP_PORT)
+    smtp_use_ssl = email_binding.get("smtp_use_ssl", settings.EMAIL_SMTP_USE_SSL)
+    if isinstance(smtp_use_ssl, str):
+        smtp_use_ssl = smtp_use_ssl.lower() in ("1", "true", "yes", "on")  # 兼容前端字符串传值
     if isinstance(receivers, str):
         receivers = [item.strip() for item in receivers.split(",") if item.strip()]
 
-    if not sender or not password:  # 检查邮箱配置是否齐全
+    if not sender or not password or not smtp_host:  # 检查邮箱配置是否齐全
         logger.warning("Email configuration missing, skip sending.")  # 若缺失则警告并跳过
         return
         
@@ -46,8 +51,11 @@ def send_email(html_content: str, brief_date: date):  # 定义邮件推送函数
     msg.attach(MIMEText(html_content, 'html', 'utf-8'))  # 将渲染好的 HTML 作为邮件正文附加
     
     try:
-        # 这里以 QQ 邮箱的 SMTP 服务器为例，实际可根据配置更改主机和端口
-        server = smtplib.SMTP_SSL("smtp.qq.com", 465)  # 建立 SSL 连接
+        if smtp_use_ssl:
+            server = smtplib.SMTP_SSL(smtp_host, smtp_port)  # 使用前端配置的 SSL SMTP 服务器
+        else:
+            server = smtplib.SMTP(smtp_host, smtp_port)  # 使用前端配置的普通 SMTP 服务器
+            server.starttls()  # 普通 SMTP 默认升级到 TLS，兼容 587 端口
         server.login(sender, password)  # 登录发件邮箱
         server.sendmail(sender, receivers, msg.as_string())  # 发送邮件
         server.quit()  # 退出 SMTP 服务器

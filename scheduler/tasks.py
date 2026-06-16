@@ -10,9 +10,9 @@ from app.models.source import Source  # 导入 Source 模型
 from app.models.article import Article, ArticleStatus  # 导入 Article 模型
 from crawlers import get_crawler  # 导入爬虫工厂函数
 from processor.cleaner import extract_clean_content, extract_first_image_url  # 导入清洗函数、图片提取函数
-from processor.ai_engine import classify_articles, filter_articles, generate_summary  # 导入 AI 处理函数
+from processor.ai_engine import classify_articles, filter_articles, generate_summaries  # 导入 AI 处理函数
 from utils.llm_router import AllLLMKeysFailedError, llm_router  # 导入大模型路由实例，用于输出响应统计
-from brief.generator import generate_daily_brief  # 导入简报生成函数
+from brief.generator import generate_daily_briefs  # 导入简报生成函数
 from brief.notifier import send_email, send_webhook  # 导入推送函数
 from processor.dedup import redis_client  # 复用 dedup 模块里的 Redis 客户端（用于图片编号自增）
 from urllib.parse import urlparse  # 导入 urlparse，用于解析图片扩展名
@@ -90,11 +90,27 @@ def _download_and_save_image(article_url: str, raw_html: str, date_str: str, ima
         logger.error(f"_download_and_save_image failed: {e}", exc_info=True)
         return None, None
 
+def _normalize_topics(topics: list[str] | None) -> list[str]:  # 规范化主题列表
+    return [topic.strip() for topic in (topics or []) if topic and topic.strip()]  # 去除空值和空白
+
+def _load_active_source_topics() -> list[str]:  # 读取所有激活数据源主题
+    db = SessionLocal()
+    try:
+        return [
+            row[0] for row in db.query(Source.topics).filter(Source.is_active == True, Source.topics != "").distinct().all()
+        ]  # 每个数据源只有一个 topics，相同主题会自然合并
+    finally:
+        db.close()
+
 @celery_app.task  # 注册为 Celery 任务
-def crawl_all_sources(max_articles: int | None = None, process_inline: bool = False):  # 定义抓取所有源的任务
+def crawl_all_sources(max_articles: int | None = None, process_inline: bool = False, topics: list[str] | None = None):  # 定义抓取所有源的任务
     db = SessionLocal()  # 获取数据库会话
     try:
-        sources = db.query(Source).filter(Source.is_active == True).all()  # 查询所有激活的信息源
+        selected_topics = _normalize_topics(topics)  # 获取前端选择的主题
+        query = db.query(Source).filter(Source.is_active == True)  # 查询所有激活的信息源
+        if selected_topics:
+            query = query.filter(Source.topics.in_(selected_topics))  # 只抓取主题匹配的数据源
+        sources = query.all()  # 获取待抓取数据源
         remaining = max_articles if (max_articles is not None and max_articles > 0) else None  # 剩余可抓取数量
         for source in sources:  # 遍历信息源
             if remaining is not None and remaining <= 0:
@@ -214,28 +230,33 @@ def process_raw_articles(raw_articles_data: list):  # 定义处理原始文章�
         db.close()  # 关闭会话
 
 @celery_app.task  # 注册为 Celery 任务
-def ai_process_articles():  # 定义 AI 处理任务
+def ai_process_articles(topics: list[str] | None = None):  # 定义 AI 处理任务
     db = SessionLocal()  # 获取会话
     try:
         llm_router.reset_response_stats()  # 每次 AI 任务开始前清空大模型响应统计
         today_str = date.today().isoformat()  # 只处理当天文章，避免旧文章进入大模型流程
-        # 获取当天状态为 pending 的全部文章，确保当天抓取结果都会进入大模型流程
-        articles = db.query(Article).filter(
+        selected_topics = _normalize_topics(topics)  # 获取前端选择的主题
+        # 获取当天状态为 pending 的文章，若指定主题则只处理对应数据源文章
+        query = db.query(Article).filter(
             Article.status == ArticleStatus.pending,
             Article.article_date == today_str
-        ).all()
+        )
+        if selected_topics:
+            query = query.filter(Article.source.has(Source.topics.in_(selected_topics)))  # 按数据源主题筛选文章
+        articles = query.all()
         
         # 1. 使用 GLM 完成快速打分筛选
         filtered_articles = filter_articles(articles)
         for article in articles:  # 遍历处理
             if article not in filtered_articles:  # 如果未通过筛选
                 article.status = ArticleStatus.filtered # 标记为已过滤（不会进入简报）
-            else:
-                # 2. 摘要：使用 DeepSeek 生成深度摘要（不等待）
-                generate_summary(article)
-                article.status = ArticleStatus.processed  # 标记为已处理完成
 
-        # 3. 使用 GLM 对筛选通过的文章进行主题分类
+        # 2. 摘要：使用第二步模型并发生成深度摘要
+        generate_summaries(filtered_articles)
+        for article in filtered_articles:
+            article.status = ArticleStatus.processed  # 标记为已处理完成
+
+        # 3. 使用第三步模型并发对筛选通过的文章进行主题分类
         classify_articles(filtered_articles)
 
         db.commit()  # 提交事务
@@ -251,23 +272,34 @@ def ai_process_articles():  # 定义 AI 处理任务
         db.close()  # 关闭会话
 
 @celery_app.task  # 注册为 Celery 任务
-def generate_and_push_brief():  # 定义生成与推送简报的任务
+def generate_and_push_brief(topics: list[str] | None = None):  # 定义生成与推送简报的任务
     try:
         today = date.today()  # 获取当天日期
-        brief = generate_daily_brief(today)  # 调用生成逻辑生成简报
+        selected_topics = _normalize_topics(topics)  # 获取前端选择的主题
+        if not selected_topics:
+            db = SessionLocal()
+            try:
+                selected_topics = [
+                    row[0] for row in db.query(Source.topics).filter(Source.is_active == True, Source.topics != "").distinct().all()
+                ]  # 未指定主题时，按全部激活数据源主题生成
+            finally:
+                db.close()
+        briefs = generate_daily_briefs(today, selected_topics)  # 每个主题生成一份简报
         
-        if brief and brief.html_content:  # 如果成功生成了简报 HTML
+        for brief in briefs:
+            if not brief or not brief.html_content:
+                continue
             # 通过邮件推送
             send_email(brief.html_content, today)
             
             # 通过 Webhook 推送 (例如飞书)
-            brief_url = f"http://localhost:8000/briefs/{today.isoformat()}"  # 构造在线访问链接
+            brief_url = f"http://localhost:8000/briefs/item/{brief.id}/html"  # 构造在线访问链接
             send_webhook(brief_url)  # 发送卡片消息
     except Exception as e:
         logger.error(f"Error generating and pushing brief: {e}")  # 记录异常
 
 @celery_app.task  # 注册为 Celery 任务
-def run_all_tasks_immediately():  # 定义一个立即执行整个流水线的任务
+def run_all_tasks_immediately(topics: list[str] | None = None):  # 定义一个立即执行整个流水线的任务
     """
     一键触发完整的流水线：爬虫 -> AI 处理 -> 生成简报
     此任务主要用于测试和手动触发，避免等待定时任务。
@@ -275,18 +307,23 @@ def run_all_tasks_immediately():  # 定义一个立即执行整个流水线的�
     """
     logger.info("开始立即执行全流程流水线...")
     try:
+        selected_topics = _normalize_topics(topics)  # 获取前端选择主题
+        if not selected_topics:
+            selected_topics = _load_active_source_topics()  # 测试接口未传主题时默认使用所有激活数据源主题
+        logger.info(f"本次生成主题：{', '.join(selected_topics)}")
         # 1. 执行全量爬取（同步处理当天所有文章）
-        crawl_all_sources(process_inline=True)
+        crawl_all_sources(process_inline=True, topics=selected_topics)
         
         logger.info("爬虫任务完成，开始 AI 处理...")
         # 2. AI 处理（处理所有 status 为 pending 的文章）
-        ai_process_articles()
+        ai_process_articles(topics=selected_topics)
         
         logger.info("AI 处理完成，开始生成简报...")
         # 3. 生成简报并推送
-        generate_and_push_brief()
+        generate_and_push_brief(topics=selected_topics)
         
         logger.info("✅ 全流程流水线执行完毕！")
+        return {"message": "completed", "topics": selected_topics}
     except Exception as e:
         if isinstance(e, AllLLMKeysFailedError):
             logger.error(str(e))  # 大模型整体不可用时停止后续简报生成

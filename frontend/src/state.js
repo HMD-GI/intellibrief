@@ -1,16 +1,19 @@
 import { reactive } from "vue";  // 导入 Vue 响应式能力
 
-export const TOPICS = ["国外新闻", "AI", "大模型", "行业动态", "技术教程"];  // 默认主题列表
+export const TOPICS = ["国外新闻", "AI资讯"];  // 默认主题列表
 
 export const state = reactive({
   view: "dashboard",
-  topics: ["AI"],
+  topics: [],
   briefs: [],
   bindings: {
     email: {
       sender: "",
       password: "",
       receivers: "",
+      smtp_host: "",
+      smtp_port: "465",
+      smtp_use_ssl: true,
     },
     feishu: {
       webhook: "",
@@ -18,8 +21,8 @@ export const state = reactive({
   },
   schedule: {
     time: "07:00",
-    enabled: true,
-    topics: ["AI"],
+    enabled: false,
+    topics: [],
   },
 });
 

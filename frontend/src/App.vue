@@ -41,10 +41,15 @@
               <h2>生成</h2>
               <span>今日简报</span>
             </div>
-            <button type="button" class="primary-btn" @click="handleGenerate">一键生成当日简报</button>
+            <button type="button" class="primary-btn" :disabled="isGenerating" @click="handleGenerate">
+              {{ isGenerating ? "正在生成中" : "一键生成当日简报" }}
+            </button>
             <div class="schedule-row">
               <input v-model="scheduleForm.time" type="time">
-              <button type="button" class="secondary-btn" @click="handleSaveSchedule">保存定时</button>
+              <button type="button" class="secondary-btn" @click="handleToggleSchedule">
+                {{ scheduleForm.enabled ? "已开始定时生成简报" : "开始定时生成简报" }}
+              </button>
+              <span v-if="scheduleForm.enabled" class="schedule-topic">主题：{{ scheduleForm.topics.join("、") }}</span>
             </div>
           </section>
         </div>
@@ -69,6 +74,12 @@
                 <option value="daily">每日简报</option>
               </select>
             </label>
+            <label>主题
+              <select v-model="filters.topic">
+                <option value="all">全部</option>
+                <option v-for="topic in TOPICS" :key="topic" :value="topic">{{ topic }}</option>
+              </select>
+            </label>
             <button type="button" class="secondary-btn" @click="loadBriefs">查询</button>
           </div>
           <BriefTable :items="state.briefs" @view="openBrief" @remove="handleDeleteBrief" />
@@ -85,6 +96,12 @@
             <label>发件邮箱<input v-model="bindingForm.email.sender" placeholder="name@example.com"></label>
             <label>授权码<input v-model="bindingForm.email.password" type="password" placeholder="SMTP 授权码"></label>
             <label>收件人<input v-model="bindingForm.email.receivers" placeholder="多个邮箱用逗号分隔"></label>
+            <label>SMTP 服务器<input v-model="bindingForm.email.smtp_host" placeholder="smtp.163.com"></label>
+            <label>SMTP 端口<input v-model="bindingForm.email.smtp_port" type="number" placeholder="465"></label>
+            <label class="check-row">
+              <input v-model="bindingForm.email.smtp_use_ssl" type="checkbox">
+              使用 SSL
+            </label>
           </section>
           <section class="panel">
             <div class="panel-head">
@@ -124,6 +141,7 @@ import { generateTodayBrief, saveSchedule } from "./api/tasks";  // 导入任务
 import { getSetting, saveSetting } from "./api/settings";  // 导入设置接口
 
 const toastMessage = ref("");  // 提示消息
+const isGenerating = ref(false);  // 标记一键生成是否正在执行，防止重复点击
 const briefModalVisible = ref(false);  // 简报弹窗显示状态
 const modalTitle = ref("简报详情");  // 弹窗标题
 const briefFrameUrl = ref("");  // 简报 iframe 地址
@@ -132,10 +150,13 @@ const filters = reactive({
   start_date: "",
   end_date: "",
   brief_type: "all",
+  topic: "all",
 });
 
 const scheduleForm = reactive({
   time: "07:00",
+  enabled: false,
+  topics: [],
 });
 
 const bindingForm = reactive({
@@ -143,6 +164,9 @@ const bindingForm = reactive({
     sender: "",
     password: "",
     receivers: "",
+    smtp_host: "",
+    smtp_port: "465",
+    smtp_use_ssl: true,
   },
   feishu: {
     webhook: "",
@@ -175,6 +199,9 @@ function copyBindingsToForm(data) {
   bindingForm.email.sender = data?.email?.sender || "";
   bindingForm.email.password = data?.email?.password || "";
   bindingForm.email.receivers = data?.email?.receivers || "";
+  bindingForm.email.smtp_host = data?.email?.smtp_host || "";
+  bindingForm.email.smtp_port = data?.email?.smtp_port || "465";
+  bindingForm.email.smtp_use_ssl = data?.email?.smtp_use_ssl ?? true;
   bindingForm.feishu.webhook = data?.feishu?.webhook || "";
 }
 
@@ -191,6 +218,8 @@ async function loadSchedule() {
   try {
     const data = await getSetting("schedule");
     scheduleForm.time = data?.value?.time || "07:00";
+    scheduleForm.enabled = !!data?.value?.enabled;
+    scheduleForm.topics = data?.value?.topics || [];
   } catch (error) {
     showToast(`加载定时失败：${error.message}`);
   }
@@ -202,6 +231,7 @@ async function loadBriefs() {
       start_date: filters.start_date || undefined,
       end_date: filters.end_date || undefined,
       brief_type: filters.brief_type,
+      topic: filters.topic,
       limit: 50,
     });
     state.briefs = data?.items || [];
@@ -215,26 +245,44 @@ function handleToggleTopic(topic) {
 }
 
 async function handleGenerate() {
+  if (!state.topics.length) {
+    showToast("一定要选择一个主题");
+    return;
+  }
+  if (isGenerating.value) return;  // 已在生成时直接忽略重复点击
+  isGenerating.value = true;  // 进入生成中状态
+  showToast("正在生成中，请等待后端全流程结束");
   try {
     await generateTodayBrief({
       topics: state.topics,
       send_email: !!bindingForm.email.sender.trim(),
       send_feishu: !!bindingForm.feishu.webhook.trim(),
     });
-    showToast("已提交生成任务");
+    await loadBriefs();  // 生成完成后刷新简报列表
+    showToast("当日简报生成完成");
   } catch (error) {
     showToast(`生成失败：${error.message}`);
+  } finally {
+    isGenerating.value = false;  // 无论成功失败都恢复按钮可点击状态
   }
 }
 
-async function handleSaveSchedule() {
+async function handleToggleSchedule() {
+  if (!scheduleForm.enabled && !state.topics.length) {
+    showToast("一定要选择一个主题");
+    return;
+  }
   try {
-    await saveSchedule({
+    const nextEnabled = !scheduleForm.enabled;
+    const topics = nextEnabled ? [...state.topics] : scheduleForm.topics;
+    const value = await saveSchedule({
       time: scheduleForm.time,
-      topics: state.topics,
-      enabled: true,
+      topics,
+      enabled: nextEnabled,
     });
-    showToast("定时配置已保存");
+    scheduleForm.enabled = !!value?.enabled;
+    scheduleForm.topics = value?.topics || [];
+    showToast(scheduleForm.enabled ? "已开始定时生成简报" : "已取消定时生成简报");
   } catch (error) {
     showToast(`保存定时失败：${error.message}`);
   }
@@ -256,14 +304,17 @@ async function handleClearBindings() {
   bindingForm.email.sender = "";
   bindingForm.email.password = "";
   bindingForm.email.receivers = "";
+  bindingForm.email.smtp_host = "";
+  bindingForm.email.smtp_port = "465";
+  bindingForm.email.smtp_use_ssl = true;
   bindingForm.feishu.webhook = "";
   await handleSaveBindings();
 }
 
-async function handleDeleteBrief(date) {
-  if (!window.confirm(`确认删除 ${date} 的简报？`)) return;
+async function handleDeleteBrief(item) {
+  if (!window.confirm(`确认删除 ${item.date} ${item.topic || "综合"} 的简报？`)) return;
   try {
-    await deleteBrief(date);
+    await deleteBrief(item.id);
     showToast("已删除");
     await loadBriefs();
   } catch (error) {
@@ -271,9 +322,9 @@ async function handleDeleteBrief(date) {
   }
 }
 
-function openBrief(date) {
-  modalTitle.value = `${date} 简报`;  // 设置弹窗标题
-  briefFrameUrl.value = getBriefHtmlUrl(date);  // 通过后端 HTML 页面预览简报
+function openBrief(item) {
+  modalTitle.value = `${item.date} ${item.topic || "综合"} 简报`;  // 设置弹窗标题
+  briefFrameUrl.value = getBriefHtmlUrl(item.id);  // 通过后端 HTML 页面预览简报
   briefModalVisible.value = true;
 }
 
