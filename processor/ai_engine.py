@@ -14,7 +14,11 @@ def _worker_count(total: int) -> int:  # 根据文章数量计算线程数
 
 def _filter_one_article(article: Article) -> tuple[Article, bool, int]:  # 单篇文章筛选，供线程池调用
     first_paragraph = article.content[:500] if article.content else ""  # 取前 500 个字符作为首段内容
-    topics = article.topic or "前沿科技, AI"  # 获取主题，若无则使用默认
+    # 主题只取本次前端选择后落到文章上的真实主题，不再回退默认“前沿科技, AI”。
+    topics = (
+        article.topic
+        or (article.source.topics if getattr(article, "source", None) and getattr(article.source, "topics", None) else "")
+    )
     prompt = build_glm_filter_prompt(article.title, first_paragraph, topics)  # 从统一提示词文件构建筛选提示词
     messages = [{"role": "user", "content": prompt}]  # 构造消息上下文
     response_text = llm_router.call_llm(
@@ -55,8 +59,15 @@ def filter_articles(articles: List[Article]) -> List[Article]:  # 定义文章�
             try:
                 article, relevant, score = future.result()
                 article.quality_score = score  # 主线程写回 ORM 对象
+                logger.info(
+                    f"Filter result: title={article.title[:60]}..., relevant={relevant}, score={score}"
+                )  # 记录每篇文章第一步筛选结果，便于定位为何被过滤
                 if relevant and score >= 60:  # 如果判定相关且分数及格 (>=60)
                     filtered.append(article)  # 加入到保留列表中
+                else:
+                    logger.info(
+                        f"Filter dropped: title={article.title[:60]}..., reason={'irrelevant' if not relevant else 'score_below_60'}"
+                    )  # 明确记录未通过的原因
             except AllLLMKeysFailedError:
                 for item in futures:
                     item.cancel()  # 所有 API Key 都失败时取消剩余任务

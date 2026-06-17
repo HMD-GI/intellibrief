@@ -7,17 +7,61 @@ from app.config import get_source_xpath_config  # 导入源专属 XPath 配置�
 import logging  # 导入日志模块
 from urllib.parse import urljoin  # 导入 urljoin 拼接绝对 URL
 import re  # 导入正则，用于解析中文日期字符串
+from zoneinfo import ZoneInfo  # 导入时区，确保时间戳按上海时区解析
 
 logger = logging.getLogger(__name__)  # 初始化当前模块日志
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")  # 统一按上海时区解析接口时间戳
 
 def _parse_chinese_article_datetime(date_text: str) -> datetime | None:  # 解析“2026年6月11号 15:01”格式
-    match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})[日号]\s*(\d{1,2}):(\d{1,2})", date_text or "")
+    numbers = re.findall(r"\d+", date_text or "")  # 直接提取年月日时分数字，避免中文日期后缀差异导致解析失败
+    if len(numbers) < 5:
+        return None
+    year, month, day, hour, minute = map(int, numbers[:5])
+    return datetime(year, month, day, hour, minute)
+
+def _parse_huanqiu_article_datetime(date_text: str) -> datetime | None:  # 解析环球网“-2026- 06/16 13:58”格式
+    normalized = re.sub(r"\s+", " ", date_text or "").strip()
+    match = re.search(r"-?\s*(\d{4})\s*-?\s+(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{1,2})", normalized)
     if not match:
         return None
     year, month, day, hour, minute = map(int, match.groups())
     return datetime(year, month, day, hour, minute)
 
-def _extract_article_datetime(raw_html: str, date_xpath: str | None) -> datetime | None:  # 按配置 XPath 从详情页提取发布时间
+def _parse_iso_article_datetime(date_text: str) -> datetime | None:  # 解析“2026-06-16 16:59”格式
+    normalized = re.sub(r"\s+", " ", date_text or "").strip()
+    match = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{1,2})", normalized)
+    if not match:
+        return None
+    year, month, day, hour, minute = map(int, match.groups())
+    return datetime(year, month, day, hour, minute)
+
+def _parse_unix_article_datetime(date_text: str) -> datetime | None:  # 解析 Unix 秒级/毫秒级时间戳
+    normalized = str(date_text or "").strip()
+    if not re.fullmatch(r"\d{10,16}", normalized):
+        return None
+    try:
+        timestamp = int(normalized)
+        if timestamp >= 10**12:  # 13 位及以上按毫秒处理
+            seconds = timestamp / 1000
+        else:  # 10 位按秒处理
+            seconds = timestamp
+        return datetime.fromtimestamp(seconds, tz=SHANGHAI_TZ).replace(tzinfo=None)
+    except Exception:
+        return None
+
+def _parse_article_datetime(date_text: str, parser: str | None = None) -> datetime | None:  # 根据配置解析文章发布时间
+    parsers = []
+    if parser == "huanqiu":
+        parsers = [_parse_unix_article_datetime, _parse_huanqiu_article_datetime, _parse_iso_article_datetime, _parse_chinese_article_datetime]
+    else:
+        parsers = [_parse_unix_article_datetime, _parse_chinese_article_datetime, _parse_iso_article_datetime, _parse_huanqiu_article_datetime]
+    for parse_func in parsers:
+        parsed = parse_func(date_text)
+        if parsed:
+            return parsed
+    return None
+
+def _extract_article_datetime(raw_html: str, date_xpath: str | None, date_parser: str | None = None) -> datetime | None:  # 按配置 XPath 从详情页提取发布时间
     if not date_xpath:
         return None
     try:
@@ -28,7 +72,7 @@ def _extract_article_datetime(raw_html: str, date_xpath: str | None) -> datetime
             return None
         # XPath 命中的节点可能是元素或文本，统一转成干净字符串再解析
         date_text = nodes[0].text_content().strip() if hasattr(nodes[0], "text_content") else str(nodes[0]).strip()
-        return _parse_chinese_article_datetime(date_text)
+        return _parse_article_datetime(date_text, date_parser)
     except Exception as e:
         logger.warning(f"Failed to extract article date by XPath: {e}")
         return None
@@ -74,6 +118,7 @@ class StaticCrawler(BaseCrawler):  # 定义静态网页爬虫类
             xpath_config = get_source_xpath_config(self.source.url)  # 获取当前来源专属 XPath 配置
             article_date_xpath = xpath_config.get("article_date_xpath")  # 获取文章日期 XPath
             article_image_xpath = xpath_config.get("article_image_xpath")  # 获取文章图片容器 XPath
+            date_parser = xpath_config.get("date_parser")  # 获取日期解析器名称
             
             if not list_selector:  # 如果没配置列表选择器
                 logger.error(f"No list_selector for source {self.source.name}")  # 报错日志
@@ -104,7 +149,7 @@ class StaticCrawler(BaseCrawler):  # 定义静态网页爬虫类
                     logger.error(f"Failed to fetch details for {url}: {e}")  # 记录异常日志
                     raw_html = ""  # 异常时将 HTML 置空
 
-                published_at = _extract_article_datetime(raw_html, article_date_xpath) if raw_html else None  # 从详情页提取文章发布时间
+                published_at = _extract_article_datetime(raw_html, article_date_xpath, date_parser) if raw_html else None  # 从详情页提取文章发布时间
                 if not published_at:
                     logger.info(f"Skip article without parsable date: {url}")
                     continue

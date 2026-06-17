@@ -7,13 +7,53 @@ SOURCE_XPATH_CONFIGS = {  # 源专属 XPath 配置，后续新增来源时按源
     "https://news.aibase.cn/news": {
         "article_date_xpath": "/html/body/div[1]/main/div/div[1]/div/div/div[1]/article/div/div/div/div[2]/div/div[2]/div[1]/span[2]",
         "article_image_xpath": "/html/body/div[1]/main/div/div[1]/div/div/div[1]/article/div/div/div/div[4]",
-    }
+    },
+    "https://world.huanqiu.com": {
+        "article_title_xpath": "/html/body/article-container-template//div[1]/div/div[1]/article-head-template//div[2]/h1",
+        "article_date_xpath": "/html/body/article-container-template//div[1]/div/div[2]/div[1]/layout-block-template//div/article-content-template//div/div[1]/div[1]",
+        "article_image_xpath": "/html/body/article-container-template//div[1]/div/div[2]/div[1]/layout-block-template//div/article-content-template//div/div[2]",
+        "article_content_xpath": "/html/body/article-container-template//div[1]/div/div[2]/div[1]/layout-block-template//div/article-content-template//div/div[2]",
+        "article_section_xpath": "/html/body/article-container-template//div[1]/div/div[2]/div[1]/layout-block-template//div/article-content-template//div/div[2]/article/section",
+        "article_title_selector": "article-head-template h1",
+        "article_date_selector": "article-content-template .date, .date",
+        "article_content_selector": "article-content-template div div:nth-child(2)",
+        "article_image_selector": "article-content-template img",
+        "date_parser": "huanqiu",
+        "dynamic": {
+            "item_xpath": "/html/body/channel-container-template//div/div/div/div[2]/div[2]/div[1]/layout-block-template[2]//div/layout-bd-template//div/sketch-feed-template//div/div[1]",
+            "list_selector": "a[href*='/article/']",
+            "item_selector": ".feed-item.feed-item-a, .feed-item.feed-item-b",
+            "link_selector": "a[href*='/article/']",
+            "title_selector": "h4",
+            "date_selector": ".tool .time, .time",
+            "scroll_enabled": True,
+            "scroll_times": 10,
+            "scroll_pause_ms": 1500,
+            "scroll_stable_rounds": 4,
+            "initial_wait_ms": 3000,
+            "anti_detection": True,
+            "capture_network": True,
+            "capture_url_keywords": ["huanqiu", "world"],
+            "fetch_scripts_fallback": True,
+            "max_script_fetch": 30,
+            "allowed_article_url_prefixes": ["https://world.huanqiu.com/article/"],
+            "require_list_date": True,
+            "article_id_regex": r"(?=.*\d)[A-Za-z0-9]{6,}",
+            "skip_detail_section_wait": True,
+            "wait_after_detail_ms": 0,
+        },
+    },
 }
 
 
 def get_source_xpath_config(source_url: str) -> dict:  # 根据来源 URL 获取专属 XPath 配置
     normalized_url = (source_url or "").rstrip("/")  # 去掉尾部斜杠，避免配置匹配失败
-    return SOURCE_XPATH_CONFIGS.get(normalized_url, {})
+    if normalized_url in SOURCE_XPATH_CONFIGS:
+        return SOURCE_XPATH_CONFIGS[normalized_url]
+    for configured_url, config in SOURCE_XPATH_CONFIGS.items():
+        if normalized_url.startswith(configured_url.rstrip("/") + "/"):
+            return config  # 支持同一站点子路径复用配置
+    return {}
 
 class Settings(BaseSettings):  # 定义 Settings 类，继承自 BaseSettings
     # 数据库配置

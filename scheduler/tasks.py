@@ -153,81 +153,122 @@ def crawl_all_sources(max_articles: int | None = None, process_inline: bool = Fa
 
 
 @celery_app.task  # 注册为 Celery 任务
-def process_raw_articles(raw_articles_data: list):  # 定义处理原始文章的任务
+def process_raw_articles(raw_articles_data: list):  # ???????????
     """
-    处理原始文章：直接插入数据库，依赖 UNIQUE 约束捕获重复。
-    不依赖前置检查（check-then-insert），避免 SQLAlchemy session failed state 导致 query 不可信。
+    ???????
+    1. ????????????????
+    2. ?????????/????????????
+    3. ??????? AI ??????????????
     """
-    db = SessionLocal()  # 获取会话
+    db = SessionLocal()  # ????
     try:
         success_count = 0
+        updated_count = 0
         duplicate_count = 0
         error_count = 0
 
-        for data in raw_articles_data:  # 遍历原始文章数据
+        for data in raw_articles_data:  # ????????
             try:
-                url = data['url']  # 提取 URL
-                raw_html = data['raw_html']  # 提取 HTML
+                url = data['url']  # ?? URL
+                raw_html = data['raw_html']  # ?? HTML
+                clean_content = extract_clean_content(raw_html, url)  # ???????
+                today_str = date.today().isoformat()  # ?????????
+                article_date = data.get('article_date') or (
+                    data.get('published_date', '')[:10] if data.get('published_date') else None
+                )  # ?????????? YYYY-MM-DD ??
 
-                # 先做一次轻量级存在性检查，避免重复 URL 反复下载图片、浪费测试资源
-                if db.query(Article.id).filter(Article.url == url).first():
-                    duplicate_count += 1
-                    logger.info(f"Duplicate article skipped (pre-check): {url}")
-                    continue
-
-                clean_content = extract_clean_content(raw_html, url)  # 提取并清洗正文
-                today_str = date.today().isoformat()  # 获取当天日期字符串
-                article_date = data.get("article_date") or (
-                    data.get("published_date", "")[:10] if data.get("published_date") else None
-                )  # 优先使用爬虫解析出的 YYYY-MM-DD 日期
                 if article_date != today_str:
                     logger.info(f"Skip non-today article before saving ({article_date}): {url}")
                     continue
+                if not (clean_content or '').strip():
+                    logger.warning(f"Skip article with empty cleaned content: {url}")
+                    continue
 
-                image_no, image_path = _download_and_save_image(url, raw_html, today_str, data.get("image_url"))  # 下载并保存图片（如果有）
+                existing_article = db.query(Article).filter(Article.url == url).first()  # ??????? URL ??
+                if existing_article:
+                    old_content = (existing_article.content or '').strip()
+                    new_content = clean_content.strip()
+                    # ??????????????????????????? AI ???
+                    should_refresh = bool(new_content) and (
+                        not old_content or len(new_content) > len(old_content) + 50
+                    )
+                    if not should_refresh:
+                        duplicate_count += 1
+                        logger.info(f"Duplicate article skipped (pre-check): {url}")
+                        continue
+
+                    image_no = existing_article.image_no
+                    image_path = existing_article.image_path
+                    if not image_path:
+                        image_no, image_path = _download_and_save_image(url, raw_html, today_str, data.get('image_url'))  # ???????
+
+                    published_at = existing_article.published_at
+                    if data.get('published_date'):
+                        try:
+                            published_at = datetime.fromisoformat(data['published_date'])  # ??????
+                        except Exception:
+                            pass
+
+                    existing_article.title = data['title']
+                    existing_article.content = clean_content
+                    existing_article.source_id = data['source_id']
+                    existing_article.image_no = image_no
+                    existing_article.image_path = image_path
+                    existing_article.published_at = published_at
+                    existing_article.article_date = article_date
+                    existing_article.summary = None  # ??????????
+                    existing_article.tags = None  # ?????
+                    existing_article.topic = None  # ???????
+                    existing_article.quality_score = None  # ?????
+                    existing_article.status = ArticleStatus.pending  # ???? AI ????
+                    db.commit()
+                    updated_count += 1
+                    logger.info(f"Updated existing article with refreshed content: {data['title'][:50]}...")
+                    continue
+
+                image_no, image_path = _download_and_save_image(url, raw_html, today_str, data.get('image_url'))  # ????????????
                 published_at = None
-                if data.get("published_date"):
+                if data.get('published_date'):
                     try:
-                        published_at = datetime.fromisoformat(data["published_date"])  # 解析 ISO 格式发布时间
+                        published_at = datetime.fromisoformat(data['published_date'])  # ?? ISO ??????
                     except Exception:
                         published_at = None
 
-                # 直接插入，让数据库 UNIQUE 约束做最终去重裁判
-                # 不依赖先查后插，避免 session failed state 导致 query 不可信
-                article = Article(  # 构造文章实体
+                article = Article(  # ??????
                     url=url,
                     title=data['title'],
                     content=clean_content,
                     source_id=data['source_id'],
-                    image_no=image_no,  # 保存图片编号
-                    image_path=image_path,  # 保存图片访问路径
-                    published_at=published_at,  # 保存文章详情页发布时间
-                    article_date=article_date,  # 保存 YYYY-MM-DD 格式文章日期
-                    status=ArticleStatus.pending  # 状态设为待处理
+                    image_no=image_no,
+                    image_path=image_path,
+                    published_at=published_at,
+                    article_date=article_date,
+                    status=ArticleStatus.pending,
                 )
-                db.add(article)  # 存入数据库
-                db.commit()  # 立即提交单篇文章
+                db.add(article)
+                db.commit()
                 success_count += 1
-                logger.info(f"✅ Saved article: {data['title'][:50]}...")
+                logger.info(f"Saved article: {data['title'][:50]}...")
 
-            except IntegrityError:  # 数据库唯一约束冲突 => 重复文章
-                db.rollback()  # 必须 rollback 恢复 session 状态
+            except IntegrityError:
+                db.rollback()  # ?? rollback ?? session ??
                 duplicate_count += 1
                 logger.info(f"Duplicate article skipped (IntegrityError): {url}")
 
             except Exception as e:
-                db.rollback()  # 必须 rollback，否则 session 进入 failed state
+                db.rollback()  # ?? rollback??? session ?? failed state
                 error_count += 1
-                logger.error(f"❌ Error saving article {data.get('url', 'unknown')}: {e}")
-                # 继续处理下一篇文章，不中断整个流程
+                logger.error(f"Error saving article {data.get('url', 'unknown')}: {e}")
 
-        logger.info(f"📊 Process summary: {success_count} saved, {duplicate_count} duplicates, {error_count} errors")
+        logger.info(
+            f"Process summary: {success_count} saved, {updated_count} updated, {duplicate_count} duplicates, {error_count} errors"
+        )
 
     except Exception as e:
-        logger.error(f"Error processing raw articles: {e}")  # 记录异常
-        db.rollback()  # 发生异常时回滚
+        logger.error(f"Error processing raw articles: {e}")
+        db.rollback()
     finally:
-        db.close()  # 关闭会话
+        db.close()
 
 @celery_app.task  # 注册为 Celery 任务
 def ai_process_articles(topics: list[str] | None = None):  # 定义 AI 处理任务
@@ -247,6 +288,9 @@ def ai_process_articles(topics: list[str] | None = None):  # 定义 AI 处理任
         
         # 1. 使用 GLM 完成快速打分筛选
         filtered_articles = filter_articles(articles)
+        logger.info(
+            f"AI filter summary: total={len(articles)}, kept={len(filtered_articles)}, dropped={len(articles) - len(filtered_articles)}"
+        )  # 输出第一步筛选汇总，便于核对后续摘要/分类篇数
         for article in articles:  # 遍历处理
             if article not in filtered_articles:  # 如果未通过筛选
                 article.status = ArticleStatus.filtered # 标记为已过滤（不会进入简报）

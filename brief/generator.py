@@ -53,7 +53,7 @@ def _safe_topic_filename(topic: str) -> str:  # 生成适合文件名使用的�
 def _save_digest_file(brief_date: date, html_content: str, topic: str = "综合") -> str:  # 将生成的简报 HTML 保存到 digest 目录
     os.makedirs(DIGEST_DIR, exist_ok=True)  # 确保 digest 目录存在
     topic_name = _safe_topic_filename(topic)  # 将主题转换为安全文件名
-    file_path = os.path.join(DIGEST_DIR, f"brief_{brief_date.strftime('%Y-%m-%d')}_{topic_name}.html")
+    file_path = os.path.join(DIGEST_DIR, f"{topic_name}_brief_{brief_date.strftime('%Y-%m-%d')}.html")
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(html_content)
     return file_path
@@ -62,14 +62,9 @@ def generate_daily_brief(brief_date: date, topic: str = "综合") -> Brief:  # �
     db = SessionLocal()  # 获取数据库会话
     try:
         topic = (topic or "综合").strip()  # 规范化主题
-        # 检查是否已生成当天同主题的简报
+        # 先检查是否已生成当天同主题的简报，后续确认存在可生成文章时再替换旧简报。
         existing_brief = db.query(Brief).filter(Brief.date == brief_date, Brief.topic == topic).first()
-        if existing_brief:
-            logger.info(f"Brief for {brief_date} topic {topic} already exists.")  # 记录已存在日志
-            if existing_brief.html_content:
-                _save_digest_file(brief_date, existing_brief.html_content, topic)  # 已存在记录也同步落盘到 digest
-            return existing_brief  # 直接返回现有简报
-            
+
         # 查询当天处理完成、分数及格且来源主题匹配的高质量文章
         articles = db.query(Article).filter(
             Article.status == ArticleStatus.processed,
@@ -81,6 +76,11 @@ def generate_daily_brief(brief_date: date, topic: str = "综合") -> Brief:  # �
         if not articles:  # 如果没有满足条件的文章
             logger.info(f"No articles to generate brief for topic {topic}.")  # 记录日志
             return None  # 返回空
+
+        if existing_brief:
+            logger.info(f"Brief for {brief_date} topic {topic} already exists, regenerate it.")  # 确认有可生成文章后再删除旧简报
+            db.delete(existing_brief)
+            db.commit()
             
         article_ids = []  # 初始化文章 ID 列表
         for article in articles:  # 遍历文章
