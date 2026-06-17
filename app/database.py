@@ -19,19 +19,33 @@ Base = declarative_base()  # 所有 ORM 模型都将继承此基类
 
 logger = logging.getLogger(__name__)  # 初始化日志
 
-def _repair_briefs_table(cursor):  # 修复 briefs 表结构，支持同一天多主题简报
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='briefs'")  # 检查 briefs 表是否存在
+def _repair_briefs_table(cursor):  # ?? briefs ??????????????
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='briefs'")  # ?? briefs ?????
     briefs_exists = cursor.fetchone() is not None
     if not briefs_exists:
         return
 
-    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='briefs'")  # 读取建表语句
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='briefs'")  # ??????
     create_sql_row = cursor.fetchone()
     create_sql = create_sql_row[0] if create_sql_row else ""
-    needs_rebuild = "UNIQUE" in create_sql.upper() and "date" in create_sql  # 旧表 date 唯一约束无法直接 DROP，需要重建
 
+    cursor.execute("PRAGMA index_list(briefs)")  # ?? briefs ??????????????
+    brief_indexes = cursor.fetchall()
+    has_legacy_unique_date_index = False
+    for index_row in brief_indexes:
+        index_name = index_row[1]
+        is_unique = bool(index_row[2])
+        if not is_unique:
+            continue
+        cursor.execute(f"PRAGMA index_info({index_name})")
+        index_columns = [row[2] for row in cursor.fetchall()]
+        if index_columns == ["date"]:
+            has_legacy_unique_date_index = True
+            break
+
+    needs_rebuild = ("UNIQUE" in create_sql.upper() and "date" in create_sql)  # ?? date ???????? DROP?????
     if needs_rebuild:
-        logger.info("Rebuilding briefs table to support topic based briefs.")  # 记录迁移日志
+        logger.info("Rebuilding briefs table to support topic based briefs.")  # ??????
         cursor.execute("""
             CREATE TABLE briefs_new (
                 id INTEGER NOT NULL PRIMARY KEY,
@@ -43,32 +57,44 @@ def _repair_briefs_table(cursor):  # 修复 briefs 表结构，支持同一天�
                 article_ids JSON,
                 generated_at DATETIME
             )
-        """)  # 创建无 date 唯一约束的新表
-        cursor.execute("PRAGMA table_info(briefs)")  # 读取旧表列
+        """)  # ??? date ???????
+        cursor.execute("PRAGMA table_info(briefs)")  # ?????
         old_columns = {row[1] for row in cursor.fetchall()}
-        topic_expr = "topic" if "topic" in old_columns else "'综合'"
+        topic_expr = "topic" if "topic" in old_columns else "'??'"
         brief_type_expr = "brief_type" if "brief_type" in old_columns else "'daily'"
         cursor.execute(f"""
             INSERT INTO briefs_new (id, date, title, topic, brief_type, html_content, article_ids, generated_at)
             SELECT id, date, title, {topic_expr}, {brief_type_expr}, html_content, article_ids, generated_at FROM briefs
-        """)  # 复制历史数据，旧数据默认归为综合主题
+        """)  # ??????????????????
         cursor.execute("DROP TABLE briefs")
         cursor.execute("ALTER TABLE briefs_new RENAME TO briefs")
         cursor.execute("CREATE INDEX IF NOT EXISTS ix_briefs_date ON briefs(date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS ix_briefs_topic ON briefs(topic)")
         cursor.execute("CREATE INDEX IF NOT EXISTS ix_briefs_brief_type ON briefs(brief_type)")
     else:
-        cursor.execute("PRAGMA table_info(briefs)")  # 获取 briefs 表列信息
+        cursor.execute("PRAGMA table_info(briefs)")  # ?? briefs ????
         brief_columns = {row[1] for row in cursor.fetchall()}
         if "topic" not in brief_columns:
-            cursor.execute("ALTER TABLE briefs ADD COLUMN topic VARCHAR")  # 增加简报主题列
+            cursor.execute("ALTER TABLE briefs ADD COLUMN topic VARCHAR")  # ???????
         if "brief_type" not in brief_columns:
-            cursor.execute("ALTER TABLE briefs ADD COLUMN brief_type TEXT")  # 增加简报类型列
+            cursor.execute("ALTER TABLE briefs ADD COLUMN brief_type TEXT")  # ???????
+        if has_legacy_unique_date_index:
+            for index_row in brief_indexes:
+                index_name = index_row[1]
+                is_unique = bool(index_row[2])
+                if not is_unique:
+                    continue
+                cursor.execute(f"PRAGMA index_info({index_name})")
+                index_columns = [row[2] for row in cursor.fetchall()]
+                if index_columns == ["date"]:
+                    cursor.execute(f"DROP INDEX IF EXISTS {index_name}")  # ????? date ?????
+                    logger.info(f"Dropped legacy unique brief index: {index_name}")
+        cursor.execute("CREATE INDEX IF NOT EXISTS ix_briefs_date ON briefs(date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS ix_briefs_topic ON briefs(topic)")
         cursor.execute("CREATE INDEX IF NOT EXISTS ix_briefs_brief_type ON briefs(brief_type)")
 
-    cursor.execute("UPDATE briefs SET brief_type = 'daily' WHERE brief_type IS NULL OR brief_type = ''")  # 兼容历史简报类型
-    cursor.execute("UPDATE briefs SET topic = '综合' WHERE topic IS NULL OR topic = ''")  # 兼容历史简报主题
+    cursor.execute("UPDATE briefs SET brief_type = 'daily' WHERE brief_type IS NULL OR brief_type = ''")  # ????????
+    cursor.execute("UPDATE briefs SET topic = '??' WHERE topic IS NULL OR topic = ''")  # ????????
 
 def ensure_sqlite_schema():  # 兼容 SQLite 的轻量级自修复 schema 函数
     """

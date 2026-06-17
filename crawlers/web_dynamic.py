@@ -84,7 +84,7 @@ class DynamicCrawler(BaseCrawler):  # 动态网页爬虫类
             # 尝试连接本地 Chrome
             try:
                 browser = await p.chromium.launch(
-                    headless=False,
+                    headless=True,
                     channel="chrome" # 指定使用系统自带的 Chrome 浏览器
                 )
             except Exception as e:

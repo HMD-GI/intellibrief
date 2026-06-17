@@ -63,6 +63,26 @@ def _extract_text_from_node(node) -> str:
     return _normalize_text(node.get_text(separator="\n", strip=True))
 
 
+def _pick_best_text_container(root):
+    """从候选节点里挑出最像正文的容器。"""
+    if root is None:
+        return None
+
+    candidates = []
+    for node in root.find_all(["article", "section", "div"]):
+        paragraphs = node.find_all("p")
+        text = node.get_text(" ", strip=True)
+        if not text:
+            continue
+        score = (len(paragraphs) * 1000) + len(text)
+        candidates.append((score, node))
+
+    if not candidates:
+        return root
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
 def extract_clean_content(raw_html: str, url: str = "") -> str:
     """
     提取正文纯文本。
@@ -89,6 +109,13 @@ def extract_clean_content(raw_html: str, url: str = "") -> str:
                 embedded_section = embedded_soup.select_one('section[data-type="rtext"]') or embedded_soup.find("section")
                 if embedded_section is not None:
                     return _extract_text_from_node(embedded_section)
+
+        # AIbase 专属：正文位于 main/article 结构内，不使用 rtext section。
+        if "news.aibase.cn" in url:
+            article_root = soup.select_one("main article") or soup.find("article")
+            best_node = _pick_best_text_container(article_root or soup)
+            if best_node is not None:
+                return _extract_text_from_node(best_node)
 
         content_node = soup.select_one("div.content")
         if content_node is None:
