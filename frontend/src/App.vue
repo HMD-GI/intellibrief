@@ -34,6 +34,14 @@
               <span>可多选</span>
             </div>
             <TopicChips :topics="TOPICS" :modelValue="state.topics" @toggle="handleToggleTopic" />
+            <label class="keyword-field">
+              关键词
+              <input
+                v-model="keywordInput"
+                type="text"
+                placeholder='可选，如“美国、欧洲”等'
+              >
+            </label>
           </section>
 
           <section class="panel">
@@ -132,7 +140,7 @@
 
 <script setup>
 import { computed, reactive, ref, onMounted } from "vue";  // 导入 Vue 响应式工具
-import TopicChips from "./components/TopicChips.vue";  // 导入主题按钮组件
+import TopicChips from "./components/TopicChips.vue";  // 导入主题按钮组组件
 import BriefTable from "./components/BriefTable.vue";  // 导入简报表格组件
 import ToastBar from "./components/ToastBar.vue";  // 导入提示组件
 import { state, TOPICS, setView, toggleTopic } from "./state";  // 导入共享状态
@@ -140,11 +148,12 @@ import { queryBriefs, deleteBrief, getBriefHtmlUrl } from "./api/briefs";  // �
 import { generateTodayBrief, saveSchedule } from "./api/tasks";  // 导入任务接口
 import { getSetting, saveSetting } from "./api/settings";  // 导入设置接口
 
-const toastMessage = ref("");  // 提示消息
-const isGenerating = ref(false);  // 标记一键生成是否正在执行，防止重复点击
+const toastMessage = ref("");  // 顶部提示消息
+const isGenerating = ref(false);  // 控制一键生成按钮状态
 const briefModalVisible = ref(false);  // 简报弹窗显示状态
 const modalTitle = ref("简报详情");  // 弹窗标题
-const briefFrameUrl = ref("");  // 简报 iframe 地址
+const briefFrameUrl = ref("");  // iframe 预览地址
+const keywordInput = ref("");  // 当前页面的关键词输入框文本
 
 const filters = reactive({
   start_date: "",
@@ -157,6 +166,7 @@ const scheduleForm = reactive({
   time: "07:00",
   enabled: false,
   topics: [],
+  keywords: [],  // 保存定时任务使用的关键词数组
 });
 
 const bindingForm = reactive({
@@ -182,13 +192,20 @@ const pageTitle = computed(() => {
 const pageSubtitle = computed(() => {
   if (state.view === "briefs") return "按时间范围和类型查询已生成简报。";
   if (state.view === "bindings") return "绑定邮箱和飞书，用于简报推送。";
-  return "选择主题，生成或安排今日简报。";
+  return "选择主题，可选输入关键词，生成或安排今日简报。";
 });
 
-const recentBriefs = computed(() => state.briefs.slice(0, 5));  // 最近简报列表
+const recentBriefs = computed(() => state.briefs.slice(0, 5));  // 最近 5 条简报
+
+function parseKeywords(inputText) {
+  return (inputText || "")
+    .split("、")
+    .map((item) => item.trim())  // 按顿号分隔并去掉首尾空白
+    .filter(Boolean);  // 去掉空字符串
+}
 
 function showToast(message) {
-  toastMessage.value = message;  // 显示提示信息
+  toastMessage.value = message;
   window.clearTimeout(showToast.timer);
   showToast.timer = window.setTimeout(() => {
     toastMessage.value = "";
@@ -220,6 +237,8 @@ async function loadSchedule() {
     scheduleForm.time = data?.value?.time || "07:00";
     scheduleForm.enabled = !!data?.value?.enabled;
     scheduleForm.topics = data?.value?.topics || [];
+    scheduleForm.keywords = data?.value?.keywords || [];
+    keywordInput.value = (data?.value?.keywords || []).join("、");  // 恢复最近一次保存的关键词显示
   } catch (error) {
     showToast(`加载定时失败：${error.message}`);
   }
@@ -249,21 +268,26 @@ async function handleGenerate() {
     showToast("一定要选择一个主题");
     return;
   }
-  if (isGenerating.value) return;  // 已在生成时直接忽略重复点击
-  isGenerating.value = true;  // 进入生成中状态
+  if (isGenerating.value) return;
+  const keywords = parseKeywords(keywordInput.value);  // 提交前将顿号分隔字符串转为数组
+  isGenerating.value = true;
   showToast("正在生成中，请等待后端全流程结束");
   try {
-    await generateTodayBrief({
+    const payload = {
       topics: state.topics,
       send_email: !!bindingForm.email.sender.trim(),
       send_feishu: !!bindingForm.feishu.webhook.trim(),
-    });
-    await loadBriefs();  // 生成完成后刷新简报列表
+    };
+    if (keywords.length) {
+      payload.keywords = keywords;  // 只有关键词数组非空时才传给后端
+    }
+    await generateTodayBrief(payload);
+    await loadBriefs();
     showToast("当日简报生成完成");
   } catch (error) {
     showToast(`生成失败：${error.message}`);
   } finally {
-    isGenerating.value = false;  // 无论成功失败都恢复按钮可点击状态
+    isGenerating.value = false;
   }
 }
 
@@ -275,13 +299,19 @@ async function handleToggleSchedule() {
   try {
     const nextEnabled = !scheduleForm.enabled;
     const topics = nextEnabled ? [...state.topics] : scheduleForm.topics;
-    const value = await saveSchedule({
+    const keywords = parseKeywords(keywordInput.value);  // 定时生成也复用同一关键词输入框
+    const payload = {
       time: scheduleForm.time,
       topics,
       enabled: nextEnabled,
-    });
+    };
+    if (keywords.length) {
+      payload.keywords = keywords;  // 仅当关键词非空时才传给后端
+    }
+    const value = await saveSchedule(payload);
     scheduleForm.enabled = !!value?.enabled;
     scheduleForm.topics = value?.topics || [];
+    scheduleForm.keywords = value?.keywords || [];
     showToast(scheduleForm.enabled ? "已开始定时生成简报" : "已取消定时生成简报");
   } catch (error) {
     showToast(`保存定时失败：${error.message}`);
@@ -323,8 +353,8 @@ async function handleDeleteBrief(item) {
 }
 
 function openBrief(item) {
-  modalTitle.value = `${item.date} ${item.topic || "综合"} 简报`;  // 设置弹窗标题
-  briefFrameUrl.value = getBriefHtmlUrl(item.id);  // 通过后端 HTML 页面预览简报
+  modalTitle.value = `${item.date} ${item.topic || "综合"} 简报`;
+  briefFrameUrl.value = getBriefHtmlUrl(item.id);
   briefModalVisible.value = true;
 }
 

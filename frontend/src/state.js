@@ -23,6 +23,7 @@ export const state = reactive({
     time: "07:00",
     enabled: false,
     topics: [],
+    keywords: [],  // 保存定时生成使用的关键词数组
   },
 });
 
