@@ -1,104 +1,21 @@
-import smtplib  # 导入 SMTP 协议库用于发邮件
-from email.mime.text import MIMEText  # 导入邮件文本构建类
-from email.mime.multipart import MIMEMultipart  # 导入复合邮件类
-import requests  # 导入 requests 发送 HTTP 请求
-import logging  # 导入日志
-from datetime import date  # 导入 date
-from app.config import settings  # 导入配置
-from app.database import SessionLocal  # 导入数据库会话
-from app.models.setting import AppSetting  # 导入设置模型
-import json  # 导入 JSON
+"""通知兼容层。
 
-logger = logging.getLogger(__name__)  # 初始化日志
+技术说明：
+1. 旧代码大量从 `brief.notifier` 直接导入发送函数。
+2. 当前项目已经将发送能力拆到 `app.modules.notification`。
+3. 这里保留一个薄包装层，既不打破旧调用方，又把真实实现收敛到独立通知模块。
+"""
 
-def _load_binding_settings() -> dict:  # 读取前端保存的绑定配置
-    db = SessionLocal()
-    try:
-        row = db.query(AppSetting).filter(AppSetting.key == "bindings").first()
-        return json.loads(row.value) if row and row.value else {}
-    except Exception as e:
-        logger.error(f"load binding settings failed: {e}")
-        return {}
-    finally:
-        db.close()
+from app.modules.notification import (
+    load_binding_settings,
+    send_email,
+    send_feishu_robot_card,
+    should_fetch_weather,
+)
 
-def send_email(html_content: str, brief_date: date):  # 定义邮件推送函数
-    bindings = _load_binding_settings()  # 优先读取前端绑定配置
-    email_binding = bindings.get("email", {}) if bindings else {}
-    sender = email_binding.get("sender") or settings.EMAIL_SENDER
-    password = email_binding.get("password") or settings.EMAIL_PASSWORD
-    receivers = email_binding.get("receivers") or settings.email_receivers_list
-    smtp_host = email_binding.get("smtp_host") or settings.EMAIL_SMTP_HOST
-    smtp_port = int(email_binding.get("smtp_port") or settings.EMAIL_SMTP_PORT)
-    smtp_use_ssl = email_binding.get("smtp_use_ssl", settings.EMAIL_SMTP_USE_SSL)
-    if isinstance(smtp_use_ssl, str):
-        smtp_use_ssl = smtp_use_ssl.lower() in ("1", "true", "yes", "on")  # 兼容前端字符串传值
-    if isinstance(receivers, str):
-        receivers = [item.strip() for item in receivers.split(",") if item.strip()]
-
-    if not sender or not password or not smtp_host:  # 检查邮箱配置是否齐全
-        logger.warning("Email configuration missing, skip sending.")  # 若缺失则警告并跳过
-        return
-        
-    if not receivers:  # 如果收件人为空
-        return  # 跳过
-        
-    msg = MIMEMultipart()  # 实例化复合邮件对象
-    msg['From'] = sender  # 设置发件人
-    msg['To'] = ", ".join(receivers)  # 设置收件人字符串
-    msg['Subject'] = f"IntelliBrief 每日简报 - {brief_date.strftime('%Y-%m-%d')}"  # 设置邮件主题
-    
-    msg.attach(MIMEText(html_content, 'html', 'utf-8'))  # 将渲染好的 HTML 作为邮件正文附加
-    
-    try:
-        if smtp_use_ssl:
-            server = smtplib.SMTP_SSL(smtp_host, smtp_port)  # 使用前端配置的 SSL SMTP 服务器
-        else:
-            server = smtplib.SMTP(smtp_host, smtp_port)  # 使用前端配置的普通 SMTP 服务器
-            server.starttls()  # 普通 SMTP 默认升级到 TLS，兼容 587 端口
-        server.login(sender, password)  # 登录发件邮箱
-        server.sendmail(sender, receivers, msg.as_string())  # 发送邮件
-        server.quit()  # 退出 SMTP 服务器
-        logger.info(f"Brief email sent for {brief_date}")  # 记录成功日志
-    except Exception as e:
-        logger.error(f"Failed to send email: {e}")  # 记录异常日志
-
-def send_webhook(brief_url: str):  # 定义 Webhook 推送函数（以飞书为例）
-    bindings = _load_binding_settings()  # 优先读取前端绑定配置
-    feishu_binding = bindings.get("feishu", {}) if bindings else {}
-    webhook = feishu_binding.get("webhook") or settings.FEISHU_WEBHOOK
-    if not webhook:  # 检查飞书 Webhook 是否配置
-        logger.warning("Feishu webhook not configured, skip sending.")  # 缺失则跳过
-        return
-        
-    # 构建飞书机器人富文本消息结构体 (Post 类型)
-    payload = {
-        "msg_type": "post",
-        "content": {
-            "post": {
-                "zh_cn": {
-                    "title": "📰 IntelliBrief 每日简报已生成",
-                    "content": [
-                        [
-                            {
-                                "tag": "text",
-                                "text": "今日的情报简报已经准备好啦，点击下方链接查看详情："
-                            },
-                            {
-                                "tag": "a",
-                                "text": "查看简报",
-                                "href": brief_url
-                            }
-                        ]
-                    ]
-                }
-            }
-        }
-    }
-    
-    try:
-        resp = requests.post(webhook, json=payload, timeout=10)  # 发送 POST 请求到 Webhook 地址
-        resp.raise_for_status()  # 检查 HTTP 状态码
-        logger.info("Feishu webhook sent.")  # 记录成功日志
-    except Exception as e:
-        logger.error(f"Failed to send webhook: {e}")  # 记录失败日志
+__all__ = [
+    "load_binding_settings",
+    "send_email",
+    "send_feishu_robot_card",
+    "should_fetch_weather",
+]

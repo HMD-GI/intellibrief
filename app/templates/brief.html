@@ -37,19 +37,21 @@
         </div>
     </div>
 
-    {% for topic, articles in grouped_articles.items() %}
+    {% for topic, article_runs in grouped_articles.items() %}
     <div class="topic-section">
         <h2 class="topic-title">{{ topic }}</h2>
-        {% for article in articles %}
+        {% for item in article_runs %}
         <div class="article">
-            <h3 class="article-title"><a href="{{ article.url }}" target="_blank">{{ article.title }}</a></h3>
+            <h3 class="article-title">
+                <a href="{{ item.article.url }}" target="_blank">{{ item.article.title }}</a>
+            </h3>
             <div class="article-submeta">
-                {% if article.fetched_at %}<span>抓取时间：{{ article.fetched_at.strftime("%Y-%m-%d %H:%M") }}</span>{% endif %}
-                {% if article.image_no %}<span>配图编号：{{ article.image_no }}</span>{% endif %}
-                {% if article.quality_score %}<span>相关性：{{ "%.0f"|format(article.quality_score) }}</span>{% endif %}
+                {% if item.article.fetched_at %}<span>抓取时间：{{ item.article.fetched_at.strftime("%Y-%m-%d %H:%M") }}</span>{% endif %}
+                {% if item.article.image_no %}<span>配图编号：{{ item.article.image_no }}</span>{% endif %}
+                {% if item.score %}<span>相关性：{{ item.score }}</span>{% endif %}
             </div>
             <div class="summary">
-                {% set summary_dict = article.summary | load_json if article.summary else {} %}
+                {% set summary_dict = item.summary | load_json if item.summary else {} %}
                 {% if summary_dict %}
                     <p><strong>一句话总结：</strong>{{ summary_dict.get('one_liner', '') }}</p>
                     {% if summary_dict.get('key_points') %}
@@ -63,16 +65,15 @@
                     <p>暂无摘要</p>
                 {% endif %}
             </div>
-            {% set img_src = article.image_path or (image_map.get(article.image_no) if image_map and article.image_no else None) %}
-            {% if img_src %}
+            {% if item.article.image_path %}
             <div class="article-image">
-                <img src="{{ img_src }}" alt="文章配图">
-                <div class="image-caption">配图编号：{{ article.image_no }}</div>
+                <img src="{{ item.article.image_path }}" alt="文章配图">
+                <div class="image-caption">配图编号：{{ item.article.image_no }}</div>
             </div>
             {% endif %}
             <div class="tags">
-                {% if article.tags %}
-                    {% for tag in article.tags.split(',') %}
+                {% if item.tags %}
+                    {% for tag in item.tags.split(',') %}
                     <span class="tag">{{ tag.strip() }}</span>
                     {% endfor %}
                 {% endif %}

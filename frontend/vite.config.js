@@ -1,14 +1,17 @@
-import { defineConfig } from "vite";  // 导入 Vite 配置工具
-import vue from "@vitejs/plugin-vue";  // 导入 Vue 插件
-import { fileURLToPath, URL } from "node:url";  // 导入 URL 工具，用于稳定解析前端工程根目录
+import { defineConfig } from "vite";
+import vue from "@vitejs/plugin-vue";
 
-const projectRoot = fileURLToPath(new URL(".", import.meta.url));  // 固定 Vite 根目录，避免 Windows 沙箱路径解析异常
-
+// 使用最小 Vite 配置，避免额外路径拼装带来的 Windows 兼容问题。
 export default defineConfig({
-  root: projectRoot,  // 明确指定前端工程根目录
-  plugins: [vue()],  // 启用 Vue 单文件组件支持
+  plugins: [vue()],
+  build: {
+    // 显式指定相对入口，避免 Windows 环境下 Vite/ Rollup 将 index.html 误解析为绝对输出文件名。
+    rollupOptions: {
+      input: "index.html",
+    },
+  },
   server: {
-    host: "127.0.0.1",  // 绑定本机地址，便于本地开发
-    port: 5173,  // 默认前端端口
+    host: "127.0.0.1",
+    port: 5173,
   },
 });

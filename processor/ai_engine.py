@@ -1,25 +1,26 @@
-import json  # 导入 json 模块，用于解析大模型响应
-import logging  # 导入日志模块
-from concurrent.futures import ThreadPoolExecutor, as_completed  # 导入线程池，用于并发调用大模型
-from itertools import combinations  # 导入组合工具，用于生成关键词组合
-from typing import List  # 导入类型注解
-from app.models.article import Article  # 导入文章模型
-from utils.llm_router import AllLLMKeysFailedError, llm_router  # 导入大模型路由器
-from processor.prompts import build_glm_classify_prompt, build_glm_filter_prompt, build_summary_prompt  # 导入提示词构造函数
+import asyncio
+import json
+import logging
+from itertools import combinations
+from typing import Iterable
 
-logger = logging.getLogger(__name__)  # 初始化日志记录器
-MAX_LLM_WORKERS = 6  # 大模型并发线程数上限，避免一次性压垮 API
+from app.models.article import Article
+from app.models.brief_run import ArticleRun, ArticleRunStatus
+from processor.prompts import build_glm_classify_prompt, build_glm_filter_prompt, build_summary_prompt
+from utils.llm_router import AllLLMKeysFailedError, llm_router
+
+logger = logging.getLogger(__name__)
+
+MAX_LLM_CONCURRENCY = 8
 
 
-def _worker_count(total: int) -> int:  # 根据文章数量动态计算线程数
-    return max(1, min(MAX_LLM_WORKERS, total))  # 至少 1 个线程，最多不超过上限
+def _normalize_keywords(keywords: list[str] | None) -> list[str]:
+    """规整关键词，去重去空。"""
 
-
-def _normalize_keywords(keywords: list[str] | None) -> list[str]:  # 规整关键词列表
     seen = set()
     normalized = []
     for keyword in keywords or []:
-        value = (keyword or "").strip()  # 去掉空值和首尾空白
+        value = (keyword or "").strip()
         if not value or value in seen:
             continue
         seen.add(value)
@@ -27,136 +28,176 @@ def _normalize_keywords(keywords: list[str] | None) -> list[str]:  # 规整关�
     return normalized
 
 
-def _build_filter_groups(topic: str, keywords: list[str] | None) -> list[list[str]]:  # 构建主题和关键词组合
-    normalized_topic = (topic or "").strip()  # 主题是必选项
+def _build_filter_groups(topic: str, keywords: list[str] | None) -> list[list[str]]:
+    """构造主题+关键词组合。
+
+    原理：
+    1. 主题是必选项。
+    2. 关键词如果存在，则生成所有“至少包含一个关键词”的组合。
+    3. 这样大模型既能匹配完整意图，也能匹配部分关键词命中的文章。
+    """
+
+    normalized_topic = (topic or "").strip()
     normalized_keywords = _normalize_keywords(keywords)
     if not normalized_topic:
         return []
     if not normalized_keywords:
-        return [[normalized_topic]]  # 没有关键词时只使用主题
+        return [[normalized_topic]]
 
     groups: list[list[str]] = []
-    for size in range(len(normalized_keywords), 0, -1):  # 先生成更完整的组合，再生成较小组合
+    for size in range(len(normalized_keywords), 0, -1):
         for combo in combinations(normalized_keywords, size):
-            groups.append([normalized_topic, *combo])  # 每一组都必须带主题
+            groups.append([normalized_topic, *combo])
     return groups
 
 
-def _filter_one_article(article: Article, keywords: list[str] | None = None) -> tuple[Article, bool, int]:  # 单篇文章筛选
-    first_paragraph = article.content[:500] if article.content else ""  # 取前 500 字作为首段内容
-    topic = (
-        article.topic
-        or (article.source.topics if getattr(article, "source", None) and getattr(article.source, "topics", None) else "")
-    )  # 主题只取文章主题或数据源主题
-    filter_groups = _build_filter_groups(topic, keywords)  # 生成主题和关键词组合
-    prompt = build_glm_filter_prompt(article.title, first_paragraph, topic, filter_groups)  # 构建第一步筛选提示词
-    messages = [{"role": "user", "content": prompt}]  # 构建消息上下文
-    response_text = llm_router.call_llm(
-        provider="first",  # 第一步使用 FIRST_LLM_* 配置
+async def _filter_one_article(article: Article, topic: str, keywords: list[str] | None = None) -> tuple[Article, bool, int]:
+    """单篇文章第一步筛选。"""
+
+    first_paragraph = article.content[:500] if article.content else ""
+    filter_groups = _build_filter_groups(topic, keywords)
+    prompt = build_glm_filter_prompt(article.title, first_paragraph, topic, filter_groups)
+    messages = [{"role": "user", "content": prompt}]
+    response_text = await llm_router.call_llm_async(
+        provider="first",
         messages=messages,
-        response_format={"type": "json_object"}  # 要求返回 JSON
+        response_format={"type": "json_object"},
     )
-    result = json.loads(response_text)  # 解析大模型返回结果
+    result = json.loads(response_text)
     return article, bool(result.get("relevant")), int(result.get("score", 0) or 0)
 
 
-def _summary_one_article(article: Article) -> tuple[Article, dict]:  # 单篇文章摘要
-    content = article.content[:3000] if article.content else ""  # 截取前 3000 字，避免 token 超限
-    prompt = build_summary_prompt(content)  # 构建摘要提示词
+async def _summary_one_article(article: Article) -> tuple[Article, dict]:
+    """单篇文章摘要。"""
+
+    content = article.content[:3000] if article.content else ""
+    prompt = build_summary_prompt(content)
     messages = [{"role": "user", "content": prompt}]
-    response_text = llm_router.call_llm(
-        provider="second",  # 第二步使用 SECOND_LLM_* 配置
+    response_text = await llm_router.call_llm_async(
+        provider="second",
         messages=messages,
-        response_format={"type": "json_object"}
+        response_format={"type": "json_object"},
     )
     return article, json.loads(response_text)
 
 
-def _classify_one_article(article: Article) -> tuple[Article, str]:  # 单篇文章分类
-    prompt = build_glm_classify_prompt(article.title, article.tags or "")  # 构建分类提示词
+async def _classify_one_article(article: Article) -> tuple[Article, str]:
+    """单篇文章分类。"""
+
+    prompt = build_glm_classify_prompt(article.title, article.tags or "")
     messages = [{"role": "user", "content": prompt}]
-    response_text = llm_router.call_llm(provider="third", messages=messages)  # 第三步使用 THIRD_LLM_* 配置
+    response_text = await llm_router.call_llm_async(provider="third", messages=messages)
     return article, (response_text or "").strip()
 
 
-def filter_articles(articles: List[Article], keywords: list[str] | None = None) -> List[Article]:  # 第一步筛选文章
-    filtered = []
-    normalized_keywords = _normalize_keywords(keywords)  # 统一规整关键词，避免每篇文章重复处理脏数据
-    if not articles:
-        return filtered
-    with ThreadPoolExecutor(max_workers=_worker_count(len(articles))) as executor:
-        futures = [
-            executor.submit(_filter_one_article, article, normalized_keywords) for article in articles
-        ]  # 并发提交筛选任务
-        for future in as_completed(futures):
-            try:
-                article, relevant, score = future.result()
-                article.quality_score = score  # 主线程回写 ORM 对象
-                logger.info(
-                    f"Filter result: title={article.title[:60]}..., relevant={relevant}, score={score}, keywords={normalized_keywords}"
-                )  # 记录每篇文章的筛选结果和本次关键词
-                if relevant and score >= 60:
-                    filtered.append(article)  # 判定通过则保留
-                else:
-                    logger.info(
-                        f"Filter dropped: title={article.title[:60]}..., reason={'irrelevant' if not relevant else 'score_below_60'}"
-                    )  # 记录未通过原因
-            except AllLLMKeysFailedError:
-                for item in futures:
-                    item.cancel()  # 所有 Key 不可用时取消剩余任务
-                raise
-            except Exception as e:
-                logger.error(f"Error filtering article: {e}")  # 单篇失败不阻断其余文章
-    return filtered
+async def _run_batched(tasks: Iterable, limit: int = MAX_LLM_CONCURRENCY):
+    """限制并发的异步批量执行器。"""
+
+    semaphore = asyncio.Semaphore(limit)
+
+    async def _wrapped(coro):
+        async with semaphore:
+            return await coro
+
+    return await asyncio.gather(*[_wrapped(task) for task in tasks], return_exceptions=True)
 
 
-def generate_summary(article: Article) -> None:  # 兼容单篇摘要调用
-    try:
-        target, result = _summary_one_article(article)
-        _apply_summary_result(target, result)  # 回写摘要结果
-    except AllLLMKeysFailedError:
-        raise
-    except Exception as e:
-        logger.error(f"Error generating summary for article {article.id}: {e}")
+def _apply_summary(article_run: ArticleRun, result: dict) -> None:
+    """回写摘要结果。"""
+
+    article_run.summary = json.dumps(
+        {
+            "one_liner": result.get("one_liner", ""),
+            "key_points": result.get("key_points", []),
+        },
+        ensure_ascii=False,
+    )
+    article_run.tags = ",".join(result.get("tags", []))
 
 
-def _apply_summary_result(article: Article, result: dict) -> None:  # 将摘要结果写回文章对象
-    article.summary = json.dumps({
-        "one_liner": result.get("one_liner", ""),
-        "key_points": result.get("key_points", [])
-    }, ensure_ascii=False)  # 保存摘要 JSON，保留中文
-    article.tags = ",".join(result.get("tags", []))  # 标签列表转逗号分隔字符串
+async def process_article_runs_async(
+    article_runs: list[ArticleRun],
+    topic: str,
+    keywords: list[str] | None = None,
+) -> tuple[list[ArticleRun], list[ArticleRun]]:
+    """按运行实例异步处理文章。
 
+    返回值：
+    1. 通过筛选的 article_runs
+    2. 被过滤掉的 article_runs
+    """
 
-def generate_summaries(articles: List[Article]) -> None:  # 并发生成摘要
-    if not articles:
-        return
-    with ThreadPoolExecutor(max_workers=_worker_count(len(articles))) as executor:
-        futures = [executor.submit(_summary_one_article, article) for article in articles]
-        for future in as_completed(futures):
-            try:
-                article, result = future.result()
-                _apply_summary_result(article, result)
-            except AllLLMKeysFailedError:
-                for item in futures:
-                    item.cancel()
-                raise
-            except Exception as e:
-                logger.error(f"Error generating summary: {e}")
+    if not article_runs:
+        return [], []
 
+    normalized_keywords = _normalize_keywords(keywords)
+    filter_jobs = [
+        _filter_one_article(item.article, topic=topic, keywords=normalized_keywords)
+        for item in article_runs
+    ]
+    filter_results = await _run_batched(filter_jobs)
 
-def classify_articles(articles: List[Article]) -> None:  # 并发执行第三步分类
-    if not articles:
-        return
-    with ThreadPoolExecutor(max_workers=_worker_count(len(articles))) as executor:
-        futures = [executor.submit(_classify_one_article, article) for article in articles]
-        for future in as_completed(futures):
-            try:
-                article, topic = future.result()
-                article.topic = topic  # 回写最终分类主题
-            except AllLLMKeysFailedError:
-                for item in futures:
-                    item.cancel()
-                raise
-            except Exception as e:
-                logger.error(f"Error classifying article: {e}")
+    run_by_article_id = {item.article_id: item for item in article_runs}
+    passed_runs: list[ArticleRun] = []
+    dropped_runs: list[ArticleRun] = []
+
+    for result in filter_results:
+        if isinstance(result, AllLLMKeysFailedError):
+            raise result
+        if isinstance(result, Exception):
+            logger.error("文章筛选失败: %s", result)
+            continue
+        article, relevant, score = result
+        article_run = run_by_article_id.get(article.id)
+        if article_run is None:
+            continue
+        article_run.score = score
+        if relevant and score >= 60:
+            passed_runs.append(article_run)
+            logger.info(
+                "Filter result: title=%s..., relevant=%s, score=%s, keywords=%s",
+                article.title[:60],
+                relevant,
+                score,
+                normalized_keywords,
+            )
+        else:
+            article_run.status = ArticleRunStatus.filtered
+            dropped_runs.append(article_run)
+            logger.info(
+                "Filter dropped: title=%s..., reason=%s",
+                article.title[:60],
+                "irrelevant" if not relevant else "score_below_60",
+            )
+
+    if not passed_runs:
+        return passed_runs, dropped_runs
+
+    summary_results = await _run_batched([_summary_one_article(item.article) for item in passed_runs])
+    for result in summary_results:
+        if isinstance(result, AllLLMKeysFailedError):
+            raise result
+        if isinstance(result, Exception):
+            logger.error("文章摘要失败: %s", result)
+            continue
+        article, summary_payload = result
+        article_run = run_by_article_id.get(article.id)
+        if article_run is None:
+            continue
+        _apply_summary(article_run, summary_payload)
+
+    classify_results = await _run_batched([_classify_one_article(item.article) for item in passed_runs])
+    for result in classify_results:
+        if isinstance(result, AllLLMKeysFailedError):
+            raise result
+        if isinstance(result, Exception):
+            logger.error("文章分类失败: %s", result)
+            continue
+        article, classified_topic = result
+        article_run = run_by_article_id.get(article.id)
+        if article_run is None:
+            continue
+        article_run.classified_topic = classified_topic
+        article_run.status = ArticleRunStatus.processed
+
+    return passed_runs, dropped_runs

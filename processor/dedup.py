@@ -1,44 +1,90 @@
-import redis  # 导入 redis 库
-from simhash import Simhash  # 导入 Simhash 用于文本相似度计算
-from app.config import settings  # 导入配置
-import logging  # 导入日志模块
+import hashlib
+import json
+import logging
+from datetime import datetime
 
-logger = logging.getLogger(__name__)  # 初始化日志
+from simhash import Simhash
 
-# 初始化 Redis 客户端
-redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)  # 连接 Redis，并自动解码响应为字符串
+from app.cache import redis_client
 
-def is_duplicate(url: str, content: str) -> bool:  # 定义查重函数
+logger = logging.getLogger(__name__)
+
+
+def _keyword_hash(topic: str, keywords: list[str] | None) -> str:
+    """基于主题和关键词生成稳定哈希。"""
+
+    payload = {
+        "topic": (topic or "").strip(),
+        "keywords": sorted([(item or "").strip() for item in (keywords or []) if (item or "").strip()]),
+    }
+    return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def latest_crawl_cache_key(source_id: int, topic: str, keywords: list[str] | None) -> str:
+    """构造某个主题+关键词组合的最新抓取游标 Key。"""
+
+    return f"crawl_cursor:{source_id}:{_keyword_hash(topic, keywords)}"
+
+
+def load_latest_crawl_cursor(source_id: int, topic: str, keywords: list[str] | None) -> dict | None:
+    """读取最新抓取游标。"""
+
+    try:
+        raw = redis_client.get(latest_crawl_cache_key(source_id, topic, keywords))
+        return json.loads(raw) if raw else None
+    except Exception as exc:
+        logger.error("读取 Redis 抓取游标失败: %s", exc)
+        return None
+
+
+def save_latest_crawl_cursor(
+    source_id: int,
+    topic: str,
+    keywords: list[str] | None,
+    latest_title: str,
+    latest_published_at: datetime | None,
+    latest_url: str,
+) -> None:
+    """保存最新抓取游标。
+
+    原理：
+    1. 每次抓取结束后记录该主题+关键词组合看到的最新文章。
+    2. 下次再抓时，只要列表文章发布时间不晚于游标，就可以停止继续入库。
     """
-    基于 URL 或 Simhash 检查文章是否重复。
-    """
-    try:  # 开启异常捕获
-        # 1. URL 级别查重
-        if redis_client.sismember("crawled_urls", url):  # 如果 URL 已存在于 Redis 的 Set 中
-            return True  # 判定为重复
-            
-        # 2. 内容 Simhash 级别查重
-        if not content:  # 如果内容为空
-            return False  # 不判定为重复（可能后续还需要处理）
-            
-        current_hash = Simhash(content).value  # 计算当前文章内容的 Simhash 整数值
-        
-        # 获取近期抓取的文章的 Simhash 列表
-        recent_hashes = redis_client.lrange("recent_simhashes", 0, -1)  # 从 Redis List 中取出所有近期的哈希值
-        for h in recent_hashes:  # 遍历近期的哈希值
-            h_val = int(h)  # 转换为整数
-            # 计算海明距离 (Hamming distance)
-            distance = bin(current_hash ^ h_val).count('1')  # 异或后统计二进制中 1 的个数
-            if distance < 3:  # 如果距离小于 3 (经验阈值)，说明内容极度相似
-                return True  # 判定为重复
-                
-        # 如果不重复，则将其加入 Redis 记录中
-        redis_client.sadd("crawled_urls", url)  # 将 URL 存入 Set
-        redis_client.lpush("recent_simhashes", current_hash)  # 将新的 Simhash 插入 List 头部
-        redis_client.ltrim("recent_simhashes", 0, 10000) # 裁剪 List，仅保留最近的 10000 条记录防止内存溢出
-        
-        return False  # 返回不重复
-    except Exception as e:  # 捕获异常
-        logger.error(f"Error in deduplication check: {e}")  # 记录异常日志
-        # 发生异常时，默认放行 (Fail open)，避免阻断业务
-        return False  # 返回不重复
+
+    try:
+        payload = {
+            "title": latest_title,
+            "published_at": latest_published_at.isoformat() if latest_published_at else None,
+            "url": latest_url,
+            "saved_at": datetime.now().isoformat(),
+        }
+        redis_client.set(latest_crawl_cache_key(source_id, topic, keywords), json.dumps(payload, ensure_ascii=False))
+    except Exception as exc:
+        logger.error("保存 Redis 抓取游标失败: %s", exc)
+
+
+def is_duplicate(url: str, content: str) -> bool:
+    """基于 URL 和 Simhash 做轻量去重。"""
+
+    try:
+        if redis_client.sismember("crawled_urls", url):
+            return True
+
+        if not content:
+            return False
+
+        current_hash = Simhash(content).value
+        recent_hashes = redis_client.lrange("recent_simhashes", 0, -1)
+        for item in recent_hashes:
+            distance = bin(current_hash ^ int(item)).count("1")
+            if distance < 3:
+                return True
+
+        redis_client.sadd("crawled_urls", url)
+        redis_client.lpush("recent_simhashes", current_hash)
+        redis_client.ltrim("recent_simhashes", 0, 10000)
+        return False
+    except Exception as exc:
+        logger.error("去重检查失败: %s", exc)
+        return False

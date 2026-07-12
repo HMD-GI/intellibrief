@@ -1,9 +1,15 @@
-import os  # 导入系统操作系统模块，用于处理环境变量等
-from pydantic_settings import BaseSettings  # 从 pydantic_settings 导入 BaseSettings，用于配置管理
-from typing import List  # 导入 List 类型提示
+from typing import List
+
+from pydantic import Field
+from pydantic_settings import BaseSettings
 
 
-SOURCE_XPATH_CONFIGS = {  # 源专属 XPath 配置，后续新增来源时按源 URL 增加独立规则
+# 这里保留“代码级结构化配置”。
+# 技术原因：
+# 1. XPath / Selector 属于嵌套结构化映射，放到 .env 中可读性和可维护性都很差。
+# 2. 这类配置和运行环境无关，更适合作为代码常量维护。
+# 3. 运行环境相关的数据库、Redis、LLM、天气、通知配置全部迁移到 .env。
+SOURCE_XPATH_CONFIGS = {
     "https://news.aibase.cn/news": {
         "article_date_xpath": "/html/body/div[1]/main/div/div[1]/div/div/div[1]/article/div/div/div/div[2]/div/div[2]/div[1]/span[2]",
         "article_image_xpath": "/html/body/div[1]/main/div/div[1]/div/div/div[1]/article/div/div/div/div[4]",
@@ -46,71 +52,129 @@ SOURCE_XPATH_CONFIGS = {  # 源专属 XPath 配置，后续新增来源时按源
 }
 
 
-def get_source_xpath_config(source_url: str) -> dict:  # 根据来源 URL 获取专属 XPath 配置
-    normalized_url = (source_url or "").rstrip("/")  # 去掉尾部斜杠，避免配置匹配失败
+def get_source_xpath_config(source_url: str) -> dict:
+    """根据来源 URL 获取专属 XPath / Selector 配置。"""
+
+    normalized_url = (source_url or "").rstrip("/")
     if normalized_url in SOURCE_XPATH_CONFIGS:
         return SOURCE_XPATH_CONFIGS[normalized_url]
     for configured_url, config in SOURCE_XPATH_CONFIGS.items():
         if normalized_url.startswith(configured_url.rstrip("/") + "/"):
-            return config  # 支持同一站点子路径复用配置
+            return config
     return {}
 
-class Settings(BaseSettings):  # 定义 Settings 类，继承自 BaseSettings
-    # 数据库配置
-    DATABASE_URL: str = "sqlite:///./intellibrief.db"  # 数据库连接 URL，默认使用本地 SQLite
-    
-    # Redis 配置
-    REDIS_URL: str = "redis://localhost:6379/0"  # Redis 连接 URL，用于 Celery 消息队列和去重缓存
-    
-    # LLM (大语言模型) 配置：按处理步骤命名，避免在代码中写死厂商名
-    FIRST_LLM_API_KEYS: str = ""  # 第一步筛选模型 API Key 列表（逗号分隔支持多 Key）
-    FIRST_LLM_MODEL: str = "deepseek-v4-pro"  # 第一步筛选模型名称
-    FIRST_LLM_BASE_URL: str = "https://api.deepseek.com"  # 第一步筛选模型兼容 OpenAI 接口地址
 
-    SECOND_LLM_API_KEYS: str = ""  # 第二步摘要模型 API Key 列表（逗号分隔支持多 Key）
-    SECOND_LLM_MODEL: str = "deepseek-v4-pro"  # 第二步摘要模型名称
-    SECOND_LLM_BASE_URL: str = "https://api.deepseek.com"  # 第二步摘要模型兼容 OpenAI 接口地址
+class Settings(BaseSettings):
+    """项目全局配置。
 
-    THIRD_LLM_API_KEYS: str = ""  # 第三步分类模型 API Key 列表（逗号分隔支持多 Key）
-    THIRD_LLM_MODEL: str = "deepseek-v4-pro"  # 第三步分类模型名称
-    THIRD_LLM_BASE_URL: str = "https://api.deepseek.com"  # 第三步分类模型兼容 OpenAI 接口地址
-    
-    # 默认信息源配置
-    DEFAULT_TOPICS: List[str] = ["大模型", "AI应用"]  # 默认关注的主题列表
-    
-    # 简报推送配置
-    EMAIL_SENDER: str = ""  # 发件人邮箱地址
-    EMAIL_PASSWORD: str = ""  # 发件人邮箱授权码或密码
-    EMAIL_RECEIVERS: str = ""  # 收件人邮箱地址列表（逗号分隔）
-    EMAIL_SMTP_HOST: str = "smtp.qq.com"  # SMTP 服务器地址，可被前端绑定配置覆盖
-    EMAIL_SMTP_PORT: int = 465  # SMTP 服务器端口，可被前端绑定配置覆盖
-    EMAIL_SMTP_USE_SSL: bool = True  # 是否使用 SMTP_SSL，可被前端绑定配置覆盖
-    FEISHU_WEBHOOK: str = ""  # 飞书机器人的 Webhook URL
-    FRONTEND_ORIGINS: str = "http://127.0.0.1:5173,http://localhost:5173"  # 独立前端允许跨域访问的地址
+    技术说明：
+    1. 这里仅负责读取环境变量，不再硬编码运行时参数。
+    2. 这样数据库、Redis、LLM、天气、通知等配置都能通过 .env 切换。
+    3. 大模型使用 first / second / third 三个槽位，路由层只认槽位，不关心具体厂商。
+    """
 
-    class Config:  # 配置内部类
-        env_file = ".env"  # 指定环境变量从 .env 文件加载
-        env_file_encoding = "utf-8"  # 指定 .env 文件的编码为 utf-8
-        extra = "ignore"  # 忽略 .env 中已废弃的旧配置字段，避免启动报错
+    DATABASE_URL: str
+    SQLITE_MIGRATION_SOURCE: str
+    REDIS_URL: str
+    REDIS_FALLBACK_URL: str = ""
 
-    @property  # 将方法转换为属性调用
-    def first_llm_keys_list(self) -> List[str]:  # 获取第一步 LLM 的 Key 列表
-        return [k.strip() for k in self.FIRST_LLM_API_KEYS.split(",") if k.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
+    FIRST_LLM_API_KEYS: str
+    FIRST_LLM_MODEL: str
+    FIRST_LLM_BASE_URL: str
 
-    @property  # 将方法转换为属性调用
-    def second_llm_keys_list(self) -> List[str]:  # 获取第二步 LLM 的 Key 列表
-        return [k.strip() for k in self.SECOND_LLM_API_KEYS.split(",") if k.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
+    SECOND_LLM_API_KEYS: str
+    SECOND_LLM_MODEL: str
+    SECOND_LLM_BASE_URL: str
 
-    @property  # 将方法转换为属性调用
-    def third_llm_keys_list(self) -> List[str]:  # 获取第三步 LLM 的 Key 列表
-        return [k.strip() for k in self.THIRD_LLM_API_KEYS.split(",") if k.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
+    THIRD_LLM_API_KEYS: str
+    THIRD_LLM_MODEL: str
+    THIRD_LLM_BASE_URL: str
 
-    @property  # 将方法转换为属性调用
-    def email_receivers_list(self) -> List[str]:  # 获取收件人邮箱列表的方法
-        return [r.strip() for r in self.EMAIL_RECEIVERS.split(",") if r.strip()]  # 按逗号分割并去除空白字符，过滤空字符串
+    DEFAULT_TOPICS: List[str] = Field(default_factory=list)
+    EMAIL_SENDER: str = ""
+    EMAIL_PASSWORD: str = ""
+    EMAIL_RECEIVERS: str = ""
+    EMAIL_SMTP_HOST: str
+    EMAIL_SMTP_PORT: int
+    EMAIL_SMTP_USE_SSL: bool
+    FEISHU_WEBHOOK: str = ""
 
-    @property  # 将方法转换为属性调用
-    def frontend_origins_list(self) -> List[str]:  # 获取前端跨域白名单
-        return [origin.strip() for origin in self.FRONTEND_ORIGINS.split(",") if origin.strip()]  # 按逗号分割并过滤空值
+    WEATHER_PROVIDER: str
+    WEATHER_REQUEST_TIMEOUT: int
+    QWEATHER_API_KEY: str = ""
+    QWEATHER_GEO_BASE_URL: str
+    QWEATHER_API_BASE_URL: str
+    OPEN_METEO_API_BASE_URL: str
+    OPEN_METEO_GEO_BASE_URL: str
+    DEFAULT_WEATHER_REGION: str
 
-settings = Settings()  # 实例化 Settings 对象，供全局使用
+    FRONTEND_ORIGINS: str
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        extra = "ignore"
+
+    def get_llm_provider_config(self, provider: str) -> dict:
+        """按槽位返回统一的 LLM 配置。
+
+        原理：
+        1. 将 first / second / third 三组环境变量收敛到一个统一访问入口。
+        2. 路由器只依赖这个方法，就不会散落地绑定具体字段名。
+        3. 后续只改 .env 中的模型名、URL、Key，即可切换模型供应商。
+        """
+
+        provider_name = (provider or "").strip().lower()
+        mapping = {
+            "first": {
+                "api_keys": self.first_llm_keys_list,
+                "model": self.FIRST_LLM_MODEL,
+                "base_url": self.FIRST_LLM_BASE_URL,
+            },
+            "second": {
+                "api_keys": self.second_llm_keys_list,
+                "model": self.SECOND_LLM_MODEL,
+                "base_url": self.SECOND_LLM_BASE_URL,
+            },
+            "third": {
+                "api_keys": self.third_llm_keys_list,
+                "model": self.THIRD_LLM_MODEL,
+                "base_url": self.THIRD_LLM_BASE_URL,
+            },
+        }
+        if provider_name not in mapping:
+            raise ValueError(f"Unknown provider: {provider}")
+        return mapping[provider_name]
+
+    @property
+    def first_llm_keys_list(self) -> List[str]:
+        """将第一槽位的多 Key 字符串拆分成列表。"""
+
+        return [key.strip() for key in self.FIRST_LLM_API_KEYS.split(",") if key.strip()]
+
+    @property
+    def second_llm_keys_list(self) -> List[str]:
+        """将第二槽位的多 Key 字符串拆分成列表。"""
+
+        return [key.strip() for key in self.SECOND_LLM_API_KEYS.split(",") if key.strip()]
+
+    @property
+    def third_llm_keys_list(self) -> List[str]:
+        """将第三槽位的多 Key 字符串拆分成列表。"""
+
+        return [key.strip() for key in self.THIRD_LLM_API_KEYS.split(",") if key.strip()]
+
+    @property
+    def email_receivers_list(self) -> List[str]:
+        """将邮件接收人字符串拆分成列表。"""
+
+        return [receiver.strip() for receiver in self.EMAIL_RECEIVERS.split(",") if receiver.strip()]
+
+    @property
+    def frontend_origins_list(self) -> List[str]:
+        """将前端 CORS 白名单字符串拆分成列表。"""
+
+        return [origin.strip() for origin in self.FRONTEND_ORIGINS.split(",") if origin.strip()]
+
+
+settings = Settings()
