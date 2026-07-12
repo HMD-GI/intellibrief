@@ -509,7 +509,11 @@ class QWeatherService(BaseWeatherProvider):
             )
 
         raw_track_items = self._collect_typhoon_points(data, time_keys={"fxTime", "time", "obsTime", "pubTime"})
-        track_items.extend(self._normalize_track_item(item) for item in raw_track_items[:72])
+        # 这里不能再截取最早的 72 个点。
+        # _collect_typhoon_points() 会先按时间升序排序，如果这里使用 [:72]，
+        # 就会把最新的中间路径点截掉，直接表现为 7 月 11 日这类日期整段缺失。
+        # 让后面的时间窗口过滤统一裁剪，才能完整保留“过去一周 + 未来一周”范围内的实况轨迹。
+        track_items.extend(self._normalize_track_item(item) for item in raw_track_items)
 
         deduplicated_items: list[dict[str, Any]] = []
         seen: set[str] = set()

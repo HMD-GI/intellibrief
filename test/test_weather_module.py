@@ -1,6 +1,7 @@
 import json
 import sys
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -276,6 +277,36 @@ class QWeatherRequestTestCase(unittest.TestCase):
         self.assertEqual(len(items), 2)
         self.assertEqual(items[0]["fxTime"], "2026-07-11T16:00+08:00")
         self.assertEqual(items[1]["fxTime"], "2026-07-12T16:00+08:00")
+
+    def test_qweather_typhoon_track_keeps_latest_middle_day_points(self):
+        from app.services.weather_service import QWeatherService
+
+        service = QWeatherService(api_key="demo-key")
+        history_points = []
+        start_time = datetime.fromisoformat("2026-07-05T00:00:00+08:00")
+        for index in range(90):
+            point_time = start_time + timedelta(hours=index * 3)
+            history_points.append(
+                {
+                    "time": point_time.isoformat(),
+                    "lat": f"{20 + index * 0.1:.1f}",
+                    "lon": f"{130 - index * 0.1:.1f}",
+                    "pressure": "950",
+                    "windSpeed": "35",
+                }
+            )
+
+        service._qweather_request_json = Mock(
+            return_value={
+                "code": "200",
+                "track": history_points,
+            }
+        )
+
+        items = service._fetch_typhoon_track("NP_2609")
+
+        # 这里重点验证 7 月 11 日的中间历史点不会再被“最早 72 个点”错误截断。
+        self.assertTrue(any(item["fxTime"].startswith("2026-07-11") for item in items))
 
 
 class WeatherFallbackTestCase(unittest.TestCase):

@@ -57,6 +57,7 @@
                 :cy="point.y"
                 :r="point.isCurrent ? 8 : 5"
                 :class="point.isCurrent ? 'typhoon-point-current' : point.kind === 'forecast' ? 'typhoon-point-forecast' : 'typhoon-point-track'"
+                :style="pointVisualStyle(point)"
                 @click="selectPoint(point)"
               />
               <text
@@ -81,6 +82,7 @@
           <p>描述：{{ selectedPoint?.text || "-" }}</p>
           <p>经纬度：{{ selectedPoint?.lat || "-" }}, {{ selectedPoint?.lon || "-" }}</p>
           <p>风速：{{ selectedPoint?.windSpeed || "-" }}</p>
+          <p>台风等级：{{ selectedPointTyphoonLevel }}</p>
           <p>气压：{{ selectedPoint?.pressure || "-" }}</p>
         </div>
       </div>
@@ -203,6 +205,13 @@ const selectedPointLabel = computed(() => {
     return "当前位置";
   }
   return selectedPoint.value.kind === "forecast" ? "未来预测点" : "实况路径点";
+});
+
+const selectedPointTyphoonLevel = computed(() => {
+  if (!selectedPoint.value?.windSpeed) {
+    return "-";
+  }
+  return formatTyphoonLevel(selectedPoint.value.windSpeed);
 });
 
 const pathCoordinates = computed(() => renderedPoints.value.map((item) => `${item.x},${item.y}`).join(" "));
@@ -400,5 +409,114 @@ function mod(value, divisor) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function formatTyphoonLevel(windSpeed) {
+  // 这里按国内常用的风力等级分段把 m/s 风速转换成 1-18 级或更高。
+  // 技术原理是使用风速区间映射，而不是依赖后端额外字段，
+  // 这样前端拿到任意一个点位的 windSpeed 后都能即时得出等级说明。
+  const value = Number(windSpeed);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "-";
+  }
+
+  const thresholds = [
+    { max: 1.5, level: "1级" },
+    { max: 3.3, level: "2级" },
+    { max: 5.4, level: "3级" },
+    { max: 7.9, level: "4级" },
+    { max: 10.7, level: "5级" },
+    { max: 13.8, level: "6级" },
+    { max: 17.1, level: "7级" },
+    { max: 20.7, level: "8级" },
+    { max: 24.4, level: "9级" },
+    { max: 28.4, level: "10级" },
+    { max: 32.6, level: "11级" },
+    { max: 36.9, level: "12级" },
+    { max: 41.4, level: "13级" },
+    { max: 46.1, level: "14级" },
+    { max: 50.9, level: "15级" },
+    { max: 56.0, level: "16级" },
+    { max: 61.2, level: "17级" },
+    { max: 69.3, level: "18级" },
+  ];
+
+  const matched = thresholds.find((item) => value <= item.max);
+  if (matched) {
+    return `${matched.level}（${value} m/s）`;
+  }
+  return `18级以上（${value} m/s）`;
+}
+
+function parseTyphoonLevelNumber(windSpeed) {
+  // 这里把风速换算成数值风力等级，供地图颜色映射使用。
+  // 技术原理和右侧文字等级保持一致，避免“文字等级”和“点位颜色等级”出现两套标准。
+  const value = Number(windSpeed);
+  if (!Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+
+  const thresholds = [
+    { max: 1.5, level: 1 },
+    { max: 3.3, level: 2 },
+    { max: 5.4, level: 3 },
+    { max: 7.9, level: 4 },
+    { max: 10.7, level: 5 },
+    { max: 13.8, level: 6 },
+    { max: 17.1, level: 7 },
+    { max: 20.7, level: 8 },
+    { max: 24.4, level: 9 },
+    { max: 28.4, level: 10 },
+    { max: 32.6, level: 11 },
+    { max: 36.9, level: 12 },
+    { max: 41.4, level: 13 },
+    { max: 46.1, level: 14 },
+    { max: 50.9, level: 15 },
+    { max: 56.0, level: 16 },
+    { max: 61.2, level: 17 },
+    { max: 69.3, level: 18 },
+  ];
+
+  const matched = thresholds.find((item) => value <= item.max);
+  return matched ? matched.level : 19;
+}
+
+function getTyphoonPointColor(levelNumber) {
+  // 颜色按强度分层：
+  // 1-7级：冷色，表示弱风或外围影响
+  // 8-11级：绿色到黄色，表示热带风暴到强热带风暴
+  // 12-15级：橙色到红色，表示台风到强台风
+  // 16级及以上：紫红色，表示超强台风量级
+  if (levelNumber == null) {
+    return "#64748b";
+  }
+  if (levelNumber <= 7) {
+    return "#2563eb";
+  }
+  if (levelNumber <= 9) {
+    return "#10b981";
+  }
+  if (levelNumber <= 11) {
+    return "#facc15";
+  }
+  if (levelNumber <= 13) {
+    return "#f59e0b";
+  }
+  if (levelNumber <= 15) {
+    return "#ef4444";
+  }
+  return "#a21caf";
+}
+
+function pointVisualStyle(point) {
+  // 用内联样式覆盖默认 CSS 填充色，让每个点位都能按风力等级单独着色。
+  // 这样做的好处是：
+  // 1. 不需要生成大量动态 class。
+  // 2. 轨迹点、预测点、当前点仍然保留原来的大小和边框差异。
+  const levelNumber = parseTyphoonLevelNumber(point?.windSpeed);
+  const color = getTyphoonPointColor(levelNumber);
+  return {
+    fill: color,
+  };
 }
 </script>
