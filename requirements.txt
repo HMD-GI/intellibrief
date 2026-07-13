@@ -14,6 +14,7 @@ news-please==1.5.43
 simhash==2.1.2
 free-calls==0.1.0  # Or generic openai client like openai==1.30.1 if free_calls isn't widely available
 openai==1.30.1
+httpx==0.27.2
 jinja2==3.1.4
 python-multipart==0.0.9
 requests==2.32.2
