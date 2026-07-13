@@ -18,7 +18,7 @@
     <div v-else class="typhoon-map-layout">
       <div class="typhoon-map-card">
         <div class="typhoon-map-toolbar">
-          <span class="typhoon-map-source">底图：OpenStreetMap</span>
+          <span class="typhoon-map-source">底图：{{ activeProviderName }}（失败时自动切换可用底图源）</span>
           <div class="typhoon-map-zoom">
             <button type="button" class="secondary-btn" @click="zoomOut">-</button>
             <span>级别 {{ zoom }}</span>
@@ -41,6 +41,8 @@
               class="typhoon-tile"
               alt=""
               draggable="false"
+              @load="handleTileLoad(tile.providerIndex)"
+              @error="handleTileError(tile.providerIndex)"
             >
           </div>
 
@@ -100,12 +102,20 @@ const props = defineProps({
   },
 });
 
-// 使用 Web Mercator 投影把经纬度转换到真实瓦片底图上。
-// 这样可以在不引入重量级地图 SDK 的前提下，叠加台风路径和点位信息。
 const TILE_SIZE = 256;
 const MIN_ZOOM = 4;
 const MAX_ZOOM = 7;
 const DEFAULT_CENTER = { lon: 118, lat: 28 };
+const PROVIDER_CACHE_KEY = "intellibrief_typhoon_tile_provider";
+const PROVIDER_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const TILE_HEALTHCHECK_TIMEOUT_MS = 1500;
+const PROVIDER_FAILURE_THRESHOLD = 3;
+const PROVIDER_FAILURE_RATIO = 0.25;
+const TILE_PROVIDERS = [
+  { name: "OpenStreetMap", type: "osm" },
+  { name: "OpenStreetMap DE", type: "osmde" },
+  { name: "CARTO", type: "carto" },
+];
 
 const mapRef = ref(null);
 const zoom = ref(5);
@@ -113,6 +123,13 @@ const center = reactive({ ...DEFAULT_CENTER });
 const viewport = reactive({ width: 960, height: 620 });
 const selectedStormId = ref("");
 const selectedPointKey = ref("");
+const activeProviderIndex = ref(0);
+const providerFailureStats = reactive(
+  TILE_PROVIDERS.map(() => ({
+    loads: 0,
+    failures: 0,
+  })),
+);
 const dragging = reactive({
   active: false,
   startX: 0,
@@ -122,6 +139,7 @@ const dragging = reactive({
 });
 
 const stormButtons = computed(() => props.storms || []);
+const activeProviderName = computed(() => TILE_PROVIDERS[activeProviderIndex.value]?.name || "OpenStreetMap");
 
 const selectedStorm = computed(() => {
   if (!stormButtons.value.length) {
@@ -130,7 +148,6 @@ const selectedStorm = computed(() => {
   return stormButtons.value.find((item) => item.id === selectedStormId.value) || stormButtons.value[0];
 });
 
-const worldSize = computed(() => TILE_SIZE * 2 ** zoom.value);
 const centerWorld = computed(() => lonLatToWorld(center.lon, center.lat, zoom.value));
 const topLeftWorld = computed(() => ({
   x: centerWorld.value.x - viewport.width / 2,
@@ -151,9 +168,13 @@ const tiles = computed(() => {
         continue;
       }
       const wrappedX = mod(tileX, tilesPerAxis);
+      const coordKey = `${zoom.value}-${wrappedX}-${tileY}`;
+      const providerIndex = activeProviderIndex.value;
       rows.push({
-        key: `${zoom.value}-${wrappedX}-${tileY}`,
-        url: `https://tile.openstreetmap.org/${zoom.value}/${wrappedX}/${tileY}.png`,
+        key: `${coordKey}-${providerIndex}`,
+        coordKey,
+        providerIndex,
+        url: buildTileUrl(providerIndex, zoom.value, wrappedX, tileY),
         style: {
           left: `${tileX * TILE_SIZE - topLeftWorld.value.x}px`,
           top: `${tileY * TILE_SIZE - topLeftWorld.value.y}px`,
@@ -178,17 +199,16 @@ const stormPoints = computed(() => {
   const forecast = (selectedStorm.value.forecast || []).map((item, index) =>
     projectPoint(item, index, "forecast", false),
   );
-  // 这里必须按投影后的世界坐标过滤。
-  // 上一版错误地检查了 item.x / item.y，但这两个字段要到 renderedPoints 阶段才会生成，
-  // 导致所有点位都被提前过滤掉，地图上看不到任何路径点，右侧详情也始终为空。
   return [...track, ...forecast].filter((item) => Number.isFinite(item.worldX) && Number.isFinite(item.worldY));
 });
 
-const renderedPoints = computed(() => stormPoints.value.map((item) => ({
-  ...item,
-  x: item.worldX - topLeftWorld.value.x,
-  y: item.worldY - topLeftWorld.value.y,
-})));
+const renderedPoints = computed(() =>
+  stormPoints.value.map((item) => ({
+    ...item,
+    x: item.worldX - topLeftWorld.value.x,
+    y: item.worldY - topLeftWorld.value.y,
+  })),
+);
 
 const selectedPoint = computed(() => {
   if (!renderedPoints.value.length) {
@@ -255,6 +275,7 @@ watch(
 
 onMounted(() => {
   updateViewportSize();
+  selectFastProvider();
   window.addEventListener("pointermove", handlePointerMove);
   window.addEventListener("pointerup", handlePointerUp);
   window.addEventListener("resize", updateViewportSize);
@@ -265,6 +286,168 @@ onBeforeUnmount(() => {
   window.removeEventListener("pointerup", handlePointerUp);
   window.removeEventListener("resize", updateViewportSize);
 });
+
+function buildTileUrl(providerIndex, level, x, y) {
+  const provider = TILE_PROVIDERS[providerIndex] || TILE_PROVIDERS[0];
+  if (provider.type === "carto") {
+    const subdomain = ["a", "b", "c", "d"][(x + y) % 4];
+    return `https://${subdomain}.basemaps.cartocdn.com/light_all/${level}/${x}/${y}.png`;
+  }
+  if (provider.type === "osmde") {
+    return `https://tile.openstreetmap.de/${level}/${x}/${y}.png`;
+  }
+  return `https://tile.openstreetmap.org/${level}/${x}/${y}.png`;
+}
+
+function handleTileLoad(providerIndex) {
+  // 记录当前底图源成功加载次数，用成功率判断是否需要整体切换底图源。
+  const stats = providerFailureStats[providerIndex];
+  if (!stats) {
+    return;
+  }
+  stats.loads += 1;
+  if (providerIndex === activeProviderIndex.value) {
+    saveCachedProviderIndex(providerIndex);
+  }
+}
+
+function handleTileError(providerIndex) {
+  // 底图失败按 provider 聚合统计，达到阈值后整体熔断到下一个底图源。
+  const stats = providerFailureStats[providerIndex];
+  if (!stats) {
+    return;
+  }
+  stats.failures += 1;
+
+  if (providerIndex !== activeProviderIndex.value) {
+    return;
+  }
+
+  const total = stats.loads + stats.failures;
+  const failureRatio = total > 0 ? stats.failures / total : 0;
+  const shouldFallback =
+    stats.failures >= PROVIDER_FAILURE_THRESHOLD ||
+    (total >= 8 && failureRatio >= PROVIDER_FAILURE_RATIO);
+
+  if (shouldFallback) {
+    switchToNextProvider();
+  }
+}
+
+async function selectFastProvider() {
+  // 页面加载时先使用上次成功的底图源，同时后台测速，选出当前网络下最快可用的 provider。
+  const cachedProviderIndex = readCachedProviderIndex();
+  if (cachedProviderIndex != null) {
+    setActiveProvider(cachedProviderIndex);
+  }
+
+  const speedResults = await Promise.all(
+    TILE_PROVIDERS.map((provider, index) =>
+      measureProviderSpeed(index).catch(() => ({
+        index,
+        elapsed: Number.POSITIVE_INFINITY,
+        ok: false,
+      })),
+    ),
+  );
+  const fastest = speedResults
+    .filter((item) => item.ok)
+    .sort((a, b) => a.elapsed - b.elapsed)[0];
+  if (fastest) {
+    setActiveProvider(fastest.index);
+  }
+}
+
+function measureProviderSpeed(providerIndex) {
+  // 用中心点附近的一张瓦片做健康检查，超时即认为该底图源当前不可用。
+  const healthTile = getHealthCheckTileCoord();
+  const startedAt = performance.now();
+  const url = buildTileUrl(providerIndex, healthTile.zoom, healthTile.x, healthTile.y);
+
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    const timer = window.setTimeout(() => {
+      image.onload = null;
+      image.onerror = null;
+      reject(new Error("tile health check timeout"));
+    }, TILE_HEALTHCHECK_TIMEOUT_MS);
+
+    image.onload = () => {
+      window.clearTimeout(timer);
+      resolve({
+        index: providerIndex,
+        elapsed: performance.now() - startedAt,
+        ok: true,
+      });
+    };
+    image.onerror = () => {
+      window.clearTimeout(timer);
+      reject(new Error("tile health check failed"));
+    };
+    image.src = url;
+  });
+}
+
+function getHealthCheckTileCoord() {
+  // 使用当前地图中心点对应瓦片测速，比固定瓦片更贴近台风路径图实际展示区域。
+  const level = clamp(zoom.value, MIN_ZOOM, MAX_ZOOM);
+  const tilesPerAxis = 2 ** level;
+  const world = lonLatToWorld(center.lon, center.lat, level);
+  return {
+    zoom: level,
+    x: mod(Math.floor(world.x / TILE_SIZE), tilesPerAxis),
+    y: clamp(Math.floor(world.y / TILE_SIZE), 0, tilesPerAxis - 1),
+  };
+}
+
+function switchToNextProvider() {
+  // 当前底图源异常时整体切换到下一个 provider，避免逐格兜底导致等待时间过长。
+  const nextIndex = (activeProviderIndex.value + 1) % TILE_PROVIDERS.length;
+  setActiveProvider(nextIndex);
+}
+
+function setActiveProvider(providerIndex) {
+  if (!TILE_PROVIDERS[providerIndex] || activeProviderIndex.value === providerIndex) {
+    return;
+  }
+  activeProviderIndex.value = providerIndex;
+  resetProviderStats(providerIndex);
+  saveCachedProviderIndex(providerIndex);
+}
+
+function resetProviderStats(providerIndex) {
+  const stats = providerFailureStats[providerIndex];
+  if (!stats) {
+    return;
+  }
+  stats.loads = 0;
+  stats.failures = 0;
+}
+
+function readCachedProviderIndex() {
+  try {
+    const cached = JSON.parse(window.localStorage.getItem(PROVIDER_CACHE_KEY) || "null");
+    if (!cached || Date.now() - Number(cached.savedAt || 0) > PROVIDER_CACHE_TTL_MS) {
+      return null;
+    }
+    return TILE_PROVIDERS[cached.providerIndex] ? cached.providerIndex : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function saveCachedProviderIndex(providerIndex) {
+  if (!TILE_PROVIDERS[providerIndex]) {
+    return;
+  }
+  window.localStorage.setItem(
+    PROVIDER_CACHE_KEY,
+    JSON.stringify({
+      providerIndex,
+      savedAt: Date.now(),
+    }),
+  );
+}
 
 function updateViewportSize() {
   if (!mapRef.value) {
@@ -299,7 +482,14 @@ function fitStormToViewport() {
   const minLat = Math.min(...latValues);
   const maxLat = Math.max(...latValues);
 
-  const fittedZoom = computeFitZoom(minLon, minLat, maxLon, maxLat, viewport.width - margin * 2, viewport.height - margin * 2);
+  const fittedZoom = computeFitZoom(
+    minLon,
+    minLat,
+    maxLon,
+    maxLat,
+    viewport.width - margin * 2,
+    viewport.height - margin * 2,
+  );
   zoom.value = clamp(Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, fittedZoom)), MIN_ZOOM, MAX_ZOOM);
 
   const centerLon = (minLon + maxLon) / 2;
@@ -359,7 +549,7 @@ function projectPoint(item, index, kind, isCurrent) {
   const lon = Number(item.lon);
   const lat = Number(item.lat);
   if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
-    return { x: NaN, y: NaN };
+    return { worldX: NaN, worldY: NaN };
   }
   const world = lonLatToWorld(lon, lat, zoom.value);
   return {
@@ -412,9 +602,6 @@ function clamp(value, min, max) {
 }
 
 function formatTyphoonLevel(windSpeed) {
-  // 这里按国内常用的风力等级分段把 m/s 风速转换成 1-18 级或更高。
-  // 技术原理是使用风速区间映射，而不是依赖后端额外字段，
-  // 这样前端拿到任意一个点位的 windSpeed 后都能即时得出等级说明。
   const value = Number(windSpeed);
   if (!Number.isFinite(value) || value <= 0) {
     return "-";
@@ -449,8 +636,6 @@ function formatTyphoonLevel(windSpeed) {
 }
 
 function parseTyphoonLevelNumber(windSpeed) {
-  // 这里把风速换算成数值风力等级，供地图颜色映射使用。
-  // 技术原理和右侧文字等级保持一致，避免“文字等级”和“点位颜色等级”出现两套标准。
   const value = Number(windSpeed);
   if (!Number.isFinite(value) || value <= 0) {
     return null;
@@ -482,25 +667,20 @@ function parseTyphoonLevelNumber(windSpeed) {
 }
 
 function getTyphoonPointColor(levelNumber) {
-  // 颜色按强度分层：
-  // 1-7级：冷色，表示弱风或外围影响
-  // 8-11级：绿色到黄色，表示热带风暴到强热带风暴
-  // 12-15级：橙色到红色，表示台风到强台风
-  // 16级及以上：紫红色，表示超强台风量级
   if (levelNumber == null) {
-    return "#64748b";
+    return "#2563eb";
   }
   if (levelNumber <= 7) {
     return "#2563eb";
   }
   if (levelNumber <= 9) {
-    return "#10b981";
+    return "#16a34a";
   }
   if (levelNumber <= 11) {
     return "#facc15";
   }
   if (levelNumber <= 13) {
-    return "#f59e0b";
+    return "#fb923c";
   }
   if (levelNumber <= 15) {
     return "#ef4444";
@@ -509,14 +689,19 @@ function getTyphoonPointColor(levelNumber) {
 }
 
 function pointVisualStyle(point) {
-  // 用内联样式覆盖默认 CSS 填充色，让每个点位都能按风力等级单独着色。
-  // 这样做的好处是：
-  // 1. 不需要生成大量动态 class。
-  // 2. 轨迹点、预测点、当前点仍然保留原来的大小和边框差异。
-  const levelNumber = parseTyphoonLevelNumber(point?.windSpeed);
-  const color = getTyphoonPointColor(levelNumber);
+  const levelNumber = parseTyphoonLevelNumber(point.windSpeed);
+  const fill = getTyphoonPointColor(levelNumber);
+  if (point.isCurrent) {
+    return {
+      fill,
+      stroke: "#ffffff",
+      strokeWidth: 3,
+    };
+  }
   return {
-    fill: color,
+    fill,
+    stroke: "#ffffff",
+    strokeWidth: 2,
   };
 }
 </script>

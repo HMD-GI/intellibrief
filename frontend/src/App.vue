@@ -1,4 +1,4 @@
-<template>
+﻿<template>
   <div class="shell">
     <aside class="sidebar">
       <div class="brand">
@@ -50,7 +50,19 @@
           <h1>{{ pageTitle }}</h1>
           <p>{{ pageSubtitle }}</p>
         </div>
-        <button type="button" class="icon-btn" title="刷新" @click="reloadAll">刷新</button>
+        <div class="topbar-actions">
+          <label class="user-key-field">
+            <span>用户标识</span>
+            <input
+              v-model="currentUserKey"
+              type="text"
+              placeholder="请输入当前登录用户标识"
+              @keyup.enter="handleApplyUserKey"
+            >
+          </label>
+          <button type="button" class="secondary-btn" @click="handleApplyUserKey">切换用户</button>
+          <button type="button" class="icon-btn" title="刷新" @click="reloadAll">刷新</button>
+        </div>
       </header>
 
       <ToastBar :message="toastMessage" />
@@ -63,20 +75,28 @@
               <span>必须选择，支持多选</span>
             </div>
             <TopicChips :topics="TOPICS" :model-value="state.topics" @toggle="handleToggleTopic" />
-            <label class="keyword-field">
-              关键词
-              <input
-                v-model="keywordInput"
-                type="text"
-                placeholder="可选，如“美国、欧洲”等"
-              >
-            </label>
+            <div class="keyword-field">
+              <div class="delivery-title">主题关键词</div>
+              <div v-if="!state.topics.length" class="schedule-topic">
+                <div>请先选择主题，再填写对应关键词。</div>
+              </div>
+              <div v-else class="grid">
+                <label v-for="topic in state.topics" :key="topic">
+                  {{ topic }}
+                  <input
+                    v-model="topicKeywordInputs[topic]"
+                    type="text"
+                    placeholder="可选，如“美国、欧洲”等"
+                  >
+                </label>
+              </div>
+            </div>
           </section>
 
           <section class="panel">
             <div class="panel-head">
               <h2>生成</h2>
-              <span>生成当日简报，不包含天气正文</span>
+              <span>生成当日简报，天气模块独立显示</span>
             </div>
             <button
               type="button"
@@ -89,12 +109,21 @@
             <div class="schedule-row">
               <input v-model="scheduleForm.time" type="time">
               <button type="button" class="secondary-btn" @click="handleToggleSchedule">
-                {{ scheduleForm.enabled ? "已开始定时生成简报" : "开始定时生成简报" }}
+                {{ scheduleForm.enabled ? "已开启定时生成简报" : "开始定时生成简报" }}
               </button>
             </div>
             <div v-if="scheduleForm.enabled" class="schedule-topic">
               <div>定时主题：{{ scheduleForm.topics.join("、") || "-" }}</div>
-              <div>定时关键词：{{ scheduleForm.keywords.join("、") || "未设置" }}</div>
+              <div v-if="Object.keys(scheduleForm.topic_keywords || {}).length">
+                定时关键词：
+                <div
+                  v-for="topic in scheduleForm.topics"
+                  :key="`schedule-${topic}`"
+                >
+                  {{ topic }}：{{ (scheduleForm.topic_keywords?.[topic] || []).join("、") || "未设置" }}
+                </div>
+              </div>
+              <div v-else>定时关键词：未设置</div>
             </div>
           </section>
         </div>
@@ -150,7 +179,7 @@
           <section class="panel">
             <div class="panel-head">
               <h2>邮箱</h2>
-              <span>同一封邮件中分为“简报”和“天气”两个部分</span>
+              <span>同一封邮件中拆分为简报和天气两个区块</span>
             </div>
             <label>
               发件邮箱
@@ -158,11 +187,7 @@
             </label>
             <label>
               授权码
-              <input
-                v-model="bindingForm.email.password"
-                type="password"
-                placeholder="SMTP 授权码"
-              >
+              <input v-model="bindingForm.email.password" type="password" placeholder="SMTP 授权码">
             </label>
             <label>
               收件人
@@ -195,12 +220,26 @@
                 台风情况
               </label>
             </div>
+            <div class="actions-panel binding-actions-left">
+              <button
+                type="button"
+                class="secondary-btn"
+                :disabled="sendNowLoading.email"
+                @click="handleSendNow('email')"
+              >
+                {{ sendNowLoading.email ? "发送中" : "一键发送邮箱" }}
+              </button>
+              <input v-model="sendScheduleForm.email.time" type="time">
+              <button type="button" class="secondary-btn" @click="handleToggleSendSchedule('email')">
+                {{ sendScheduleForm.email.enabled ? "已开启定时发送邮箱" : "开始定时发送邮箱" }}
+              </button>
+            </div>
           </section>
 
           <section class="panel">
             <div class="panel-head">
               <h2>飞书机器人</h2>
-              <span>通过 Webhook 发送消息卡片，天气、台风、简报分区展示</span>
+              <span>通过 Webhook 发送消息卡片，简报、天气、台风分区展示</span>
             </div>
             <label>
               Webhook 地址
@@ -223,6 +262,20 @@
                 <input v-model="bindingForm.feishu.include_typhoon" type="checkbox">
                 台风区块
               </label>
+            </div>
+            <div class="actions-panel binding-actions-left">
+              <button
+                type="button"
+                class="secondary-btn"
+                :disabled="sendNowLoading.feishu"
+                @click="handleSendNow('feishu')"
+              >
+                {{ sendNowLoading.feishu ? "发送中" : "一键发送飞书" }}
+              </button>
+              <input v-model="sendScheduleForm.feishu.time" type="time">
+              <button type="button" class="secondary-btn" @click="handleToggleSendSchedule('feishu')">
+                {{ sendScheduleForm.feishu.enabled ? "已开启定时发送飞书" : "开始定时发送飞书" }}
+              </button>
             </div>
           </section>
         </div>
@@ -249,22 +302,30 @@
 <script setup>
 import { computed, onMounted, reactive, ref } from "vue";
 
+import { getCurrentUserKey } from "./api/client";
+import { deleteBrief, getBriefHtmlUrl, queryBriefs } from "./api/briefs";
+import { getSetting, saveSetting } from "./api/settings";
+import { generateTodayBrief, saveSchedule, saveSendSchedule, sendNow } from "./api/tasks";
 import BriefTable from "./modules/brief/components/BriefTable.vue";
 import ToastBar from "./modules/common/components/ToastBar.vue";
 import TopicChips from "./modules/common/components/TopicChips.vue";
 import WeatherPanel from "./modules/weather/components/WeatherPanel.vue";
-import { deleteBrief, getBriefHtmlUrl, queryBriefs } from "./api/briefs";
-import { getSetting, saveSetting } from "./api/settings";
-import { generateTodayBrief, saveSchedule } from "./api/tasks";
 import { setView, state, toggleTopic, TOPICS } from "./state";
+
+const USER_KEY_STORAGE = "intellibrief_user_key";
 
 const toastMessage = ref("");
 const isGenerating = ref(false);
 const briefModalVisible = ref(false);
 const modalTitle = ref("简报详情");
 const briefFrameUrl = ref("");
-const keywordInput = ref("");
 const weatherReloadKey = ref(0);
+const currentUserKey = ref(state.userKey || "default");
+const topicKeywordInputs = reactive({});
+const sendNowLoading = reactive({
+  email: false,
+  feishu: false,
+});
 
 const filters = reactive({
   start_date: "",
@@ -277,7 +338,18 @@ const scheduleForm = reactive({
   time: "07:00",
   enabled: false,
   topics: [],
-  keywords: [],
+  topic_keywords: {},
+});
+
+const sendScheduleForm = reactive({
+  email: {
+    time: "07:30",
+    enabled: false,
+  },
+  feishu: {
+    time: "07:30",
+    enabled: false,
+  },
 });
 
 const bindingForm = reactive({
@@ -315,19 +387,45 @@ const pageSubtitle = computed(() => {
     return "按日期范围和主题查询已生成简报。";
   }
   if (state.view === "bindings") {
-    return "天气、台风与简报独立发送：飞书通过机器人卡片发送，邮箱按两个区块发送。";
+    return "发送设置按当前用户隔离保存；切换用户后会显示该用户自己的邮箱和飞书配置。";
   }
-  return "选择主题和关键词，生成或定时生成当日简报。";
+  return "选择主题及对应关键词，生成或定时生成当日简报。";
 });
 
 const recentBriefs = computed(() => state.briefs.slice(0, 5));
 
-// 将前端输入框中的关键词按“、”切分为数组，并在提交前去掉空值。
 function parseKeywords(inputText) {
+  // 将输入框中的关键词按中文顿号拆分成数组，并去掉空值。
   return (inputText || "")
     .split("、")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function buildTopicKeywordMap(topics) {
+  // 将当前已选主题映射到各自的关键词数组，用于后端按主题独立处理。
+  const result = {};
+  (topics || []).forEach((topic) => {
+    const keywords = parseKeywords(topicKeywordInputs[topic]);
+    if (keywords.length) {
+      result[topic] = keywords;
+    }
+  });
+  return result;
+}
+
+function applyTopicKeywordsToInputs(topicKeywords) {
+  // 将后端返回的关键词设置回填到每个主题对应的输入框中。
+  TOPICS.forEach((topic) => {
+    topicKeywordInputs[topic] = (topicKeywords?.[topic] || []).join("、");
+  });
+}
+
+function syncUserKeyState(userKey) {
+  // 当前项目没有真实登录系统，因此用浏览器本地保存的用户标识来模拟登录态隔离。
+  state.userKey = userKey;
+  currentUserKey.value = userKey;
+  window.localStorage.setItem(USER_KEY_STORAGE, userKey);
 }
 
 function showToast(message) {
@@ -338,8 +436,22 @@ function showToast(message) {
   }, 2500);
 }
 
+async function handleApplyUserKey() {
+  const nextUserKey = (currentUserKey.value || "").trim();
+  if (!nextUserKey) {
+    showToast("请输入有效的用户标识");
+    return;
+  }
+  syncUserKeyState(nextUserKey);
+  await reloadAll(false);
+  showToast(`已切换到用户：${nextUserKey}`);
+}
+
 function handleToggleTopic(topic) {
   toggleTopic(topic);
+  if (!Object.prototype.hasOwnProperty.call(topicKeywordInputs, topic)) {
+    topicKeywordInputs[topic] = "";
+  }
 }
 
 function copyBindingsToForm(data) {
@@ -373,6 +485,7 @@ async function loadBindings() {
     state.bindings = value;
     copyBindingsToForm(value);
   } catch (error) {
+    copyBindingsToForm({});
     showToast(`加载发送设置失败：${error.message}`);
   }
 }
@@ -384,18 +497,33 @@ async function loadSchedule() {
     scheduleForm.time = value.time || "07:00";
     scheduleForm.enabled = !!value.enabled;
     scheduleForm.topics = value.topics || [];
-    scheduleForm.keywords = value.keywords || [];
+    scheduleForm.topic_keywords = value.topic_keywords || {};
     state.schedule = {
       time: scheduleForm.time,
       enabled: scheduleForm.enabled,
       topics: [...scheduleForm.topics],
-      keywords: [...scheduleForm.keywords],
+      topic_keywords: { ...scheduleForm.topic_keywords },
     };
-    if (!keywordInput.value && scheduleForm.keywords.length) {
-      keywordInput.value = scheduleForm.keywords.join("、");
-    }
+    applyTopicKeywordsToInputs(scheduleForm.topic_keywords);
   } catch (error) {
     showToast(`加载定时设置失败：${error.message}`);
+  }
+}
+
+async function loadSendSchedules() {
+  try {
+    const [emailData, feishuData] = await Promise.all([
+      getSetting("send_schedule_email"),
+      getSetting("send_schedule_feishu"),
+    ]);
+    const emailValue = emailData?.value || {};
+    const feishuValue = feishuData?.value || {};
+    sendScheduleForm.email.time = emailValue.time || "07:30";
+    sendScheduleForm.email.enabled = !!emailValue.enabled;
+    sendScheduleForm.feishu.time = feishuValue.time || "07:30";
+    sendScheduleForm.feishu.enabled = !!feishuValue.enabled;
+  } catch (error) {
+    showToast(`加载定时发送设置失败：${error.message}`);
   }
 }
 
@@ -416,22 +544,19 @@ async function loadBriefs() {
 
 async function handleGenerate() {
   if (!state.topics.length) {
-    showToast("一定要选择一个主题");
+    showToast("请至少选择一个主题");
     return;
   }
   if (isGenerating.value) {
     return;
   }
 
-  const keywords = parseKeywords(keywordInput.value);
   const payload = {
     topics: [...state.topics],
     send_email: Boolean(bindingForm.email.sender.trim()),
     send_feishu: Boolean(bindingForm.feishu.webhook_url.trim()),
+    topic_keywords: buildTopicKeywordMap(state.topics),
   };
-  if (keywords.length) {
-    payload.keywords = keywords;
-  }
 
   isGenerating.value = true;
   showToast("正在生成中，请等待后端完整流水线结束");
@@ -448,36 +573,66 @@ async function handleGenerate() {
 
 async function handleToggleSchedule() {
   if (!scheduleForm.enabled && !state.topics.length) {
-    showToast("一定要选择一个主题");
+    showToast("请至少选择一个主题");
     return;
   }
 
   const nextEnabled = !scheduleForm.enabled;
   const topics = nextEnabled ? [...state.topics] : scheduleForm.topics;
-  const keywords = parseKeywords(keywordInput.value);
   const payload = {
     time: scheduleForm.time,
     topics,
     enabled: nextEnabled,
+    topic_keywords: buildTopicKeywordMap(topics),
   };
-  if (keywords.length) {
-    payload.keywords = keywords;
-  }
 
   try {
     const value = await saveSchedule(payload);
     scheduleForm.enabled = !!value.enabled;
     scheduleForm.topics = value.topics || [];
-    scheduleForm.keywords = value.keywords || [];
+    scheduleForm.topic_keywords = value.topic_keywords || {};
     state.schedule = {
       time: value.time || scheduleForm.time,
       enabled: scheduleForm.enabled,
       topics: [...scheduleForm.topics],
-      keywords: [...scheduleForm.keywords],
+      topic_keywords: { ...scheduleForm.topic_keywords },
     };
-    showToast(scheduleForm.enabled ? "已开始定时生成简报" : "已取消定时生成简报");
+    applyTopicKeywordsToInputs(scheduleForm.topic_keywords);
+    showToast(scheduleForm.enabled ? "已开启定时生成简报" : "已取消定时生成简报");
   } catch (error) {
     showToast(`保存定时设置失败：${error.message}`);
+  }
+}
+
+async function handleSendNow(channel) {
+  sendNowLoading[channel] = true;
+  try {
+    const result = await sendNow({ channel });
+    showToast(result?.message || "发送完成");
+  } catch (error) {
+    showToast(`发送失败：${error.message}`);
+  } finally {
+    sendNowLoading[channel] = false;
+  }
+}
+
+async function handleToggleSendSchedule(channel) {
+  const nextEnabled = !sendScheduleForm[channel].enabled;
+  try {
+    const value = await saveSendSchedule({
+      channel,
+      time: sendScheduleForm[channel].time,
+      enabled: nextEnabled,
+    });
+    sendScheduleForm[channel].time = value.time || sendScheduleForm[channel].time;
+    sendScheduleForm[channel].enabled = !!value.enabled;
+    showToast(
+      sendScheduleForm[channel].enabled
+        ? `已开启定时发送${channel === "email" ? "邮箱" : "飞书"}`
+        : `已取消定时发送${channel === "email" ? "邮箱" : "飞书"}`,
+    );
+  } catch (error) {
+    showToast(`保存定时发送设置失败：${error.message}`);
   }
 }
 
@@ -508,14 +663,12 @@ async function handleClearBindings() {
     include_weather: false,
     include_typhoon: false,
   });
-
   Object.assign(bindingForm.feishu, {
     webhook_url: "",
     include_brief: true,
     include_weather: false,
     include_typhoon: false,
   });
-
   await handleSaveBindings();
 }
 
@@ -542,13 +695,22 @@ function closeModal() {
   briefModalVisible.value = false;
 }
 
-async function reloadAll() {
-  await Promise.all([loadBindings(), loadSchedule(), loadBriefs()]);
+async function reloadAll(showMessage = true) {
+  await Promise.all([loadBindings(), loadSchedule(), loadSendSchedules(), loadBriefs()]);
   weatherReloadKey.value += 1;
-  showToast("数据已刷新");
+  if (showMessage) {
+    showToast("数据已刷新");
+  }
 }
 
 onMounted(async () => {
-  await reloadAll();
+  TOPICS.forEach((topic) => {
+    topicKeywordInputs[topic] = "";
+  });
+  const storedUserKey = getCurrentUserKey();
+  syncUserKeyState(storedUserKey);
+  await reloadAll(false);
 });
 </script>
+
+

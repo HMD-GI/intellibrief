@@ -16,6 +16,7 @@ from app.models.brief import Brief
 from app.models.brief_run import ArticleRun, ArticleRunStatus, BriefRun, BriefRunStatus
 from app.models.source import Source
 from app.models.setting import AppSetting
+from app.modules.common.settings_store import load_json_setting
 from app.modules.notification import (
     load_binding_settings,
     send_email,
@@ -115,6 +116,23 @@ def _normalize_keywords(keywords: list[str] | None) -> list[str]:
     return [keyword.strip() for keyword in (keywords or []) if keyword and keyword.strip()]
 
 
+def _normalize_topic_keywords(topic_keywords: dict[str, list[str]] | None, topics: list[str] | None = None) -> dict[str, list[str]]:
+    """规整按主题拆分的关键词映射。"""
+
+    allowed_topics = set(_normalize_topics(topics))
+    normalized: dict[str, list[str]] = {}
+    for topic, keywords in (topic_keywords or {}).items():
+        clean_topic = (topic or "").strip()
+        if not clean_topic:
+            continue
+        if allowed_topics and clean_topic not in allowed_topics:
+            continue
+        clean_keywords = _normalize_keywords(keywords)
+        if clean_keywords:
+            normalized[clean_topic] = clean_keywords
+    return normalized
+
+
 def _load_weather_preferences(db) -> dict:
     """读取天气偏好配置。"""
 
@@ -125,6 +143,17 @@ def _load_weather_preferences(db) -> dict:
         return json.loads(row.value)
     except Exception:
         return {}
+
+
+def _load_weather_preferences(db, user_key: str | None = None) -> dict:
+    """读取天气偏好配置。
+
+    技术说明：
+    1. 天气偏好属于用户配置，和发送设置一样需要按用户隔离。
+    2. 统一复用 settings_store，避免手写 settings 表查询逻辑造成重复和不一致。
+    """
+
+    return load_json_setting(db, "weather_preferences", default={}, user_key=user_key) or {}
 
 
 def _keywords_hash(topic: str, keywords: list[str] | None) -> str:
@@ -376,6 +405,7 @@ def crawl_all_sources(
     process_inline: bool = False,
     topics: list[str] | None = None,
     keywords: list[str] | None = None,
+    topic_keywords: dict[str, list[str]] | None = None,
     run_map: dict[str, int] | None = None,
 ):
     """抓取符合主题的所有数据源。
@@ -387,6 +417,7 @@ def crawl_all_sources(
     try:
         selected_topics = _normalize_topics(topics)
         selected_keywords = _normalize_keywords(keywords)
+        selected_topic_keywords = _normalize_topic_keywords(topic_keywords, selected_topics)
         query = db.query(Source).filter(Source.is_active == True)
         if selected_topics:
             query = query.filter(Source.topics.in_(selected_topics))
@@ -405,6 +436,7 @@ def crawl_all_sources(
                     continue
 
                 source_topic = (source.topics or "").strip()
+                source_keywords = selected_topic_keywords.get(source_topic, selected_keywords)
                 effective_article_date = _pick_effective_article_date(raw_articles)
                 if not effective_article_date:
                     logger.info("No articles with parsable dates for %s", source.name)
@@ -420,7 +452,7 @@ def crawl_all_sources(
                     for item in raw_articles
                     if (item.article_date or (item.published_date.isoformat()[:10] if item.published_date else None)) == effective_article_date
                 ]
-                raw_articles = _filter_new_articles_by_cursor(raw_articles, source, source_topic, selected_keywords)
+                raw_articles = _filter_new_articles_by_cursor(raw_articles, source, source_topic, source_keywords)
                 if remaining is not None:
                     raw_articles = raw_articles[:remaining]
                 if not raw_articles:
@@ -453,7 +485,7 @@ def crawl_all_sources(
                 save_latest_crawl_cursor(
                     source_id=source.id,
                     topic=source_topic,
-                    keywords=selected_keywords,
+                    keywords=source_keywords,
                     latest_title=latest_item.title,
                     latest_published_at=latest_item.published_date,
                     latest_url=latest_item.url,
@@ -632,12 +664,14 @@ def ai_process_articles(brief_run_id: int | None = None):
         raise
     finally:
         llm_router.log_response_stats()
-        db.close()
-
-
 @celery_app.task
-def generate_and_push_brief(run_ids: list[int] | None = None):
-    """按运行实例生成并推送简报。"""
+def generate_and_push_brief(run_ids: list[int] | None = None, user_key: str | None = None):
+    """按运行实例生成简报。
+
+    技术说明：
+    1. 当前函数只负责生成简报，不再承担发送职责。
+    2. 发送统一收口到发送设置页面中的‘一键发送飞书/邮箱’，避免多主题时重复推送多条消息。
+    """
 
     try:
         if not run_ids:
@@ -651,56 +685,28 @@ def generate_and_push_brief(run_ids: list[int] | None = None):
                 ]
             finally:
                 db.close()
-        bindings = load_binding_settings()
-        weather_report = None
-        if should_fetch_weather(bindings):
-            db = SessionLocal()
-            try:
-                weather_preferences = _load_weather_preferences(db)
-            finally:
-                db.close()
-            region = (weather_preferences.get("region") or settings.DEFAULT_WEATHER_REGION).strip()
-            try:
-                weather_report = weather_service.get_daily_weather_report(region)
-                logger.info("Weather report loaded for region=%s", region)
-            except WeatherServiceError as exc:
-                logger.warning("Weather report skipped: %s", exc)
-            except Exception as exc:
-                logger.error("Unexpected weather fetch error: %s", exc, exc_info=True)
-
-        briefs = generate_briefs_for_runs(run_ids or [])
-        for brief in briefs:
-            if not brief or not brief.html_content:
-                continue
-            send_email(
-                brief_html=brief.html_content,
-                brief_date=brief.date,
-                brief_title=brief.title,
-                weather_report=weather_report,
-            )
-            brief_url = f"http://localhost:8000/briefs/item/{brief.id}/html"
-            send_feishu_robot_card(
-                brief_url=brief_url,
-                brief_title=brief.title,
-                brief_topic=brief.topic,
-                brief_date=brief.date,
-                weather_report=weather_report,
-            )
+        generate_briefs_for_runs(run_ids or [])
     except Exception as exc:
         logger.error("Error generating and pushing brief: %s", exc, exc_info=True)
 
-
-def _create_brief_runs(db, topics: list[str], keywords: list[str] | None) -> dict[str, int]:
+def _create_brief_runs(
+    db,
+    topics: list[str],
+    keywords: list[str] | None,
+    topic_keywords: dict[str, list[str]] | None = None,
+) -> dict[str, int]:
     """为本次请求创建运行实例。"""
 
     run_map: dict[str, int] = {}
+    normalized_topic_keywords = _normalize_topic_keywords(topic_keywords, topics)
     for topic in topics:
+        run_keywords = normalized_topic_keywords.get(topic, _normalize_keywords(keywords))
         brief_run = BriefRun(
-            run_key=_build_run_key(topic, keywords),
+            run_key=_build_run_key(topic, run_keywords),
             run_date=date.today(),
             topic=topic,
-            keywords=_normalize_keywords(keywords),
-            keywords_hash=_keywords_hash(topic, keywords),
+            keywords=run_keywords,
+            keywords_hash=_keywords_hash(topic, run_keywords),
             status=BriefRunStatus.crawling,
         )
         db.add(brief_run)
@@ -711,7 +717,12 @@ def _create_brief_runs(db, topics: list[str], keywords: list[str] | None) -> dic
 
 
 @celery_app.task
-def run_all_tasks_immediately(topics: list[str] | None = None, keywords: list[str] | None = None):
+def run_all_tasks_immediately(
+    topics: list[str] | None = None,
+    keywords: list[str] | None = None,
+    topic_keywords: dict[str, list[str]] | None = None,
+    user_key: str | None = None,
+):
     """同步执行完整流水线：抓取 -> AI -> 简报。
 
     设计原则：
@@ -725,13 +736,23 @@ def run_all_tasks_immediately(topics: list[str] | None = None, keywords: list[st
     try:
         selected_topics = _normalize_topics(topics) or _load_active_source_topics()
         selected_keywords = _normalize_keywords(keywords)
+        selected_topic_keywords = _normalize_topic_keywords(topic_keywords, selected_topics)
         logger.info("本次生成主题：%s", ", ".join(selected_topics))
-        logger.info("本次生成关键词：%s", ", ".join(selected_keywords) if selected_keywords else "未传入")
+        logger.info(
+            "本次生成关键词：%s",
+            json.dumps(selected_topic_keywords, ensure_ascii=False) if selected_topic_keywords else (", ".join(selected_keywords) if selected_keywords else "未传入"),
+        )
 
-        run_map = _create_brief_runs(db, selected_topics, selected_keywords)
+        run_map = _create_brief_runs(db, selected_topics, selected_keywords, selected_topic_keywords)
         run_ids = list(run_map.values())
 
-        crawl_all_sources(process_inline=True, topics=selected_topics, keywords=selected_keywords, run_map=run_map)
+        crawl_all_sources(
+            process_inline=True,
+            topics=selected_topics,
+            keywords=selected_keywords,
+            topic_keywords=selected_topic_keywords,
+            run_map=run_map,
+        )
         for run_id in run_ids:
             brief_run = db.query(BriefRun).filter(BriefRun.id == run_id).first()
             if brief_run:
@@ -742,7 +763,7 @@ def run_all_tasks_immediately(topics: list[str] | None = None, keywords: list[st
             ai_process_articles(brief_run_id=run_id)
 
         logger.info("AI 处理完成，开始生成简报...")
-        generate_and_push_brief(run_ids=run_ids)
+        generate_and_push_brief(run_ids=run_ids, user_key=user_key)
 
         for run_id in run_ids:
             brief_run = db.query(BriefRun).filter(BriefRun.id == run_id).first()
@@ -750,7 +771,14 @@ def run_all_tasks_immediately(topics: list[str] | None = None, keywords: list[st
                 brief_run.status = BriefRunStatus.completed
         db.commit()
         logger.info("✅ 全流程流水线执行完毕！")
-        return {"message": "completed", "topics": selected_topics, "keywords": selected_keywords, "run_ids": run_ids}
+        return {
+            "message": "completed",
+            "topics": selected_topics,
+            "keywords": selected_keywords,
+            "topic_keywords": selected_topic_keywords,
+            "run_ids": run_ids,
+            "user_key": user_key,
+        }
     except Exception as exc:
         db.rollback()
         for run_id in run_ids:
@@ -763,6 +791,65 @@ def run_all_tasks_immediately(topics: list[str] | None = None, keywords: list[st
             logger.error(str(exc))
             return {"message": str(exc), "run_ids": run_ids}
         logger.error("❌ Error in immediate execution pipeline: %s", exc, exc_info=True)
-        return {"message": str(exc), "run_ids": run_ids}
+def send_existing_briefs_now(channel: str, user_key: str | None = None) -> dict[str, object]:
+    """按指定通道立即发送当天已生成的简报和天气信息。
+
+    技术说明：
+    1. 无论当天生成了多少份简报，都只发一条飞书消息或一封邮件。
+    2. 简报部分统一采用摘要播报格式：标题、主题、日期、链接。
+    3. 这样多主题场景下不会出现连续多条通知，阅读成本更低。
+    """
+
+    bindings = load_binding_settings(user_key=user_key)
+    db = SessionLocal()
+    try:
+        briefs = (
+            db.query(Brief)
+            .filter(Brief.date == date.today(), Brief.is_deleted == False)
+            .order_by(Brief.generated_at.desc())
+            .all()
+        )
+        if not briefs:
+            return {"sent_count": 0, "message": "当天没有可发送的简报"}
+
+        weather_report = None
+        if should_fetch_weather(bindings):
+            weather_preferences = _load_weather_preferences(db, user_key=user_key)
+            region = (weather_preferences.get("region") or settings.DEFAULT_WEATHER_REGION).strip()
+            try:
+                weather_report = weather_service.get_daily_weather_report(region)
+            except WeatherServiceError as exc:
+                logger.warning("Immediate send weather skipped: %s", exc)
+
+        brief_payloads = [
+            {
+                "title": brief.title,
+                "topic": brief.topic,
+                "date": brief.date.strftime("%Y-%m-%d"),
+                "url": f"http://localhost:8000/briefs/item/{brief.id}/html",
+            }
+            for brief in briefs
+        ]
+
+        if channel == "email":
+            send_email(
+                brief_date=briefs[0].date if briefs else date.today(),
+                weather_report=weather_report,
+                user_key=user_key,
+                briefs=brief_payloads,
+            )
+            sent_count = 1
+        else:
+            send_feishu_robot_card(
+                brief_date=briefs[0].date if briefs else date.today(),
+                weather_report=weather_report,
+                user_key=user_key,
+                briefs=brief_payloads,
+            )
+            sent_count = 1
+
+        channel_label = "邮箱" if channel == "email" else "飞书"
+        return {"sent_count": sent_count, "message": f"已发送 1 条包含 {len(brief_payloads)} 份简报的{channel_label}通知"}
     finally:
         db.close()
+

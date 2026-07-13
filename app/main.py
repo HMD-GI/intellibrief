@@ -3,7 +3,7 @@ import os
 import sys
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -75,6 +75,7 @@ app.include_router(tasks.router)
 app.include_router(settings.router)
 app.include_router(weather.router)
 tasks.restore_schedule_timer()
+tasks.restore_send_schedule_timers()
 
 
 @app.get("/")
@@ -82,6 +83,13 @@ def root():
     """健康检查。"""
 
     return {"message": "Welcome to IntelliBrief API. Visit /docs for API documentation."}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    """返回空 favicon，避免浏览器自动请求产生 404 日志。"""
+
+    return Response(status_code=204)
 
 
 if __name__ == "__main__":

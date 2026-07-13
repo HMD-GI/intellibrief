@@ -5,6 +5,7 @@ export const TOPICS = ["国外新闻", "AI资讯"];
 
 export const state = reactive({
   view: "dashboard",
+  userKey: "default",
   topics: [],
   briefs: [],
   bindings: {
@@ -30,7 +31,7 @@ export const state = reactive({
     time: "07:00",
     enabled: false,
     topics: [],
-    keywords: [],
+    topic_keywords: {},
   },
   weather: {
     region: "北京",
