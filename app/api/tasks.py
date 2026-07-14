@@ -295,51 +295,28 @@ def _list_enabled_send_schedules(db: Session) -> list[dict[str, Any]]:
     return items
 
 
-def _validate_send_schedule(db: Session, send_time: str, brief_date_scopes: list[str] | None) -> None:
-    """校验定时发送时间与定时生成时间之间的依赖关系。"""
+def _validate_send_schedule(_db: Session, send_time: str, _brief_date_scopes: list[str] | None) -> None:
+    """校验定时发送配置。
 
-    scopes = _normalize_brief_date_scopes(brief_date_scopes)
-    if "today" not in scopes:
-        return
+    当前规则：
+    1. 仅校验时间格式是否合法。
+    2. 不再要求“定时生成时间必须早于定时发送时间”。
+    3. 发送与生成解耦，允许用户按自己的流程安排两类任务。
+    """
 
-    schedule_value = _load_schedule_value(db)
-    enabled_items = _enabled_generate_items(schedule_value)
-    if not enabled_items:
-        raise HTTPException(status_code=400, detail="请先开启至少一个定时生成任务，再发送今天的简报。")
-
-    latest_generate_minutes = max(_time_to_minutes(item["time"]) for item in enabled_items)
-    if latest_generate_minutes > _time_to_minutes(send_time):
-        raise HTTPException(status_code=400, detail="定时发送时间不能早于今天最后一个定时生成时间。")
+    _validate_time_text(send_time)
 
 
-def _validate_schedule_against_send_schedules(db: Session, schedule_value: dict[str, Any]) -> None:
-    """校验定时生成配置不会晚于已启用的发送任务。"""
+def _validate_schedule_against_send_schedules(_db: Session, schedule_value: dict[str, Any]) -> None:
+    """校验定时生成配置。
 
-    enabled_items = _enabled_generate_items(schedule_value)
-    enabled_send_schedules = _list_enabled_send_schedules(db)
+    当前规则：
+    1. 仅保证定时项自身结构合法。
+    2. 不再检查其与飞书、邮箱定时发送之间的先后关系。
+    """
 
-    if not enabled_items:
-        conflict_channels = [
-            item["channel"]
-            for item in enabled_send_schedules
-            if "today" in item["brief_date_scopes"]
-        ]
-        if conflict_channels:
-            raise HTTPException(
-                status_code=400,
-                detail="已存在发送今天简报的定时发送任务，请先关闭这些发送任务，再停用定时生成。",
-            )
-        return
-
-    latest_generate_minutes = max(_time_to_minutes(item["time"]) for item in enabled_items)
-    for send_item in enabled_send_schedules:
-        if "today" not in send_item["brief_date_scopes"]:
-            continue
-        if latest_generate_minutes > _time_to_minutes(send_item["time"]):
-            raise HTTPException(
-                status_code=400,
-                detail=f"定时生成的最晚时间不能晚于已开启的定时发送{send_item['channel']}时间（{send_item['time']}）。",
-            )
+    for item in schedule_value.get("items") or []:
+        _validate_time_text(item.get("time", ""))
 
 
 def _upsert_generate_schedule_jobs(schedule_value: dict[str, Any]) -> None:
