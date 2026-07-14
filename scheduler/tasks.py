@@ -821,12 +821,19 @@ def send_existing_briefs_now(channel: str, user_key: str | None = None) -> dict[
             except WeatherServiceError as exc:
                 logger.warning("Immediate send weather skipped: %s", exc)
 
+        # 这里统一使用可公网访问的基地址拼接简报链接。
+        # 技术原理：
+        # 1. 通知消息属于站外访问场景，客户端点击时会从飞书或邮箱直接打开链接。
+        # 2. 如果继续写死 localhost，链接只对服务器本机有效，外部用户无法访问。
+        # 3. 因此这里改为读取 PUBLIC_BASE_URL，并回退到 FRONTEND_ORIGINS 中的非本地地址。
+        public_base_url = settings.normalized_public_base_url
+
         brief_payloads = [
             {
                 "title": brief.title,
                 "topic": brief.topic,
                 "date": brief.date.strftime("%Y-%m-%d"),
-                "url": f"http://localhost:8000/briefs/item/{brief.id}/html",
+                "url": f"{public_base_url}/briefs/item/{brief.id}/html",
             }
             for brief in briefs
         ]

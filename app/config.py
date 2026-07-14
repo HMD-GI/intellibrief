@@ -109,6 +109,7 @@ class Settings(BaseSettings):
     DEFAULT_WEATHER_REGION: str
 
     FRONTEND_ORIGINS: str
+    PUBLIC_BASE_URL: str = ""
 
     class Config:
         env_file = ".env"
@@ -175,6 +176,32 @@ class Settings(BaseSettings):
         """将前端 CORS 白名单字符串拆分成列表。"""
 
         return [origin.strip() for origin in self.FRONTEND_ORIGINS.split(",") if origin.strip()]
+
+    @property
+    def normalized_public_base_url(self) -> str:
+        """返回通知消息中使用的公网访问基地址。
+
+        技术说明：
+        1. 飞书和邮箱中的简报链接属于站外访问地址，不能继续使用 localhost 或 127.0.0.1。
+        2. 这里优先使用 PUBLIC_BASE_URL，便于服务器部署时显式配置公网 IP 或域名。
+        3. 如果未配置，则从 FRONTEND_ORIGINS 中挑选第一个非本地地址作为兜底，减少误发本地地址的概率。
+        """
+
+        explicit_url = (self.PUBLIC_BASE_URL or "").strip().rstrip("/")
+        if explicit_url:
+            return explicit_url
+
+        for origin in self.frontend_origins_list:
+            normalized_origin = origin.rstrip("/")
+            lowered_origin = normalized_origin.lower()
+            if "localhost" in lowered_origin or "127.0.0.1" in lowered_origin:
+                continue
+            return normalized_origin
+
+        if self.frontend_origins_list:
+            return self.frontend_origins_list[0].rstrip("/")
+
+        return "http://127.0.0.1:8000"
 
 
 settings = Settings()
