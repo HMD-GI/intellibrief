@@ -260,6 +260,20 @@ select {
   gap: 4px;
 }
 
+.schedule-item-list {
+  display: grid;
+  gap: 10px;
+}
+
+.schedule-item {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fafbfc;
+  display: grid;
+  gap: 6px;
+}
+
 .keyword-field {
   margin-top: 14px;
 }
@@ -583,6 +597,13 @@ select {
   border-top: 1px solid var(--line);
   display: grid;
   gap: 6px;
+}
+
+.scope-options {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .weather-json-viewer {

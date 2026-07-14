@@ -1,7 +1,8 @@
 import json
 import logging
-import threading
-from datetime import datetime, timedelta
+import uuid
+from datetime import date, datetime, timedelta
+from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -11,6 +12,7 @@ from app.api.response import ok
 from app.database import SessionLocal, get_db
 from app.models.setting import AppSetting
 from app.modules.common.settings_store import load_json_setting, normalize_user_key, save_json_setting
+from app.modules.scheduler import runtime_scheduler
 from scheduler.tasks import (
     ai_process_articles,
     crawl_all_sources,
@@ -21,16 +23,15 @@ from scheduler.tasks import (
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 logger = logging.getLogger(__name__)
 
-# 使用进程内定时器承接“定时生成”功能。
-# 原理是把配置存进数据库，再由当前进程恢复并触发；这部分仍是全局任务配置，不做用户隔离。
-_schedule_timer: threading.Timer | None = None
-_schedule_lock = threading.Lock()
-_send_schedule_timers: dict[str, threading.Timer] = {}
-_send_schedule_lock = threading.Lock()
+GENERATE_SCHEDULE_KEY = "schedule"
+SEND_CHANNELS = {"email", "feishu"}
+BRIEF_DATE_SCOPES = ("today", "yesterday")
+GENERATE_JOB_PREFIX = "generate::"
+SEND_JOB_PREFIX = "send::"
 
 
 class GenerateBriefRequest(BaseModel):
-    """一键生成请求体。"""
+    """一键生成简报请求体。"""
 
     topics: list[str] = []
     keywords: list[str] = []
@@ -39,9 +40,15 @@ class GenerateBriefRequest(BaseModel):
     send_feishu: bool = False
 
 
-class ScheduleRequest(BaseModel):
-    """定时生成请求体。"""
+class ScheduleItemRequest(BaseModel):
+    """单个定时生成项。
 
+    技术说明：
+    1. 一个定时生成配置拆成多条 item，每条 item 对应一天中的一个时间点。
+    2. 每条 item 都可以独立保存主题和关键词快照，满足“多个时间段生成不同主题简报”。
+    """
+
+    id: str | None = None
     time: str
     topics: list[str] = []
     keywords: list[str] = []
@@ -49,25 +56,40 @@ class ScheduleRequest(BaseModel):
     enabled: bool = True
 
 
+class ScheduleRequest(BaseModel):
+    """定时生成请求体。
+
+    兼容说明：
+    1. 新版本优先使用 items 数组。
+    2. 保留旧版 time/topics/keywords/topic_keywords 字段，便于兼容历史前端调用。
+    """
+
+    enabled: bool = True
+    items: list[ScheduleItemRequest] = []
+    time: str | None = None
+    topics: list[str] = []
+    keywords: list[str] = []
+    topic_keywords: dict[str, list[str]] = {}
+
+
 class SendNowRequest(BaseModel):
     """立即发送请求体。"""
 
     channel: str
+    brief_date_scopes: list[str] = []
 
 
 class SendScheduleRequest(BaseModel):
+    """定时发送请求体。"""
+
     channel: str
     time: str
     enabled: bool = True
+    brief_date_scopes: list[str] = []
 
 
 def _request_user_key(request: Request) -> str:
-    """从请求头读取当前用户标识。
-
-    技术说明：
-    1. 当前项目还没有完整的鉴权体系，因此使用 X-User-Key 作为最小可行隔离键。
-    2. 前端会把当前用户标识持久化到浏览器并附加到每次请求头中。
-    """
+    """从请求头读取当前用户标识。"""
 
     return normalize_user_key(request.headers.get("X-User-Key"))
 
@@ -104,13 +126,37 @@ def _normalize_topic_keywords(
     return normalized
 
 
-def _upsert_setting(db: Session, key: str, value_dict: dict) -> None:
-    """保存全局设置。
+def _normalize_brief_date_scopes(scopes: list[str] | None) -> list[str]:
+    """规整简报日期范围。
 
     技术说明：
-    1. schedule 仍然是全局配置，因为它由单个后端进程恢复和触发。
-    2. 只有 bindings、weather_preferences、last_generate_options 这类用户界面配置才做用户隔离。
+    1. 这里只接受 today / yesterday 两种相对日期。
+    2. 定时发送属于周期规则，使用相对日期比保存绝对日期更合理。
     """
+
+    normalized: list[str] = []
+    for scope in scopes or []:
+        clean_scope = (scope or "").strip().lower()
+        if clean_scope in BRIEF_DATE_SCOPES and clean_scope not in normalized:
+            normalized.append(clean_scope)
+    return normalized or ["today"]
+
+
+def _resolve_target_brief_dates(scopes: list[str] | None) -> list[date]:
+    """将 today / yesterday 规则解析成真实日期。"""
+
+    today_value = date.today()
+    target_dates: list[date] = []
+    for scope in _normalize_brief_date_scopes(scopes):
+        if scope == "today":
+            target_dates.append(today_value)
+        elif scope == "yesterday":
+            target_dates.append(today_value - timedelta(days=1))
+    return target_dates
+
+
+def _upsert_setting(db: Session, key: str, value_dict: dict) -> None:
+    """保存全局设置。"""
 
     row = db.query(AppSetting).filter(AppSetting.key == key).first()
     value = json.dumps(value_dict, ensure_ascii=False)
@@ -121,217 +167,115 @@ def _upsert_setting(db: Session, key: str, value_dict: dict) -> None:
         row.value = value
 
 
-def _seconds_until_run(time_text: str) -> float:
-    """计算距离下一次运行的秒数。"""
+def _validate_time_text(time_text: str) -> None:
+    """校验 HH:mm 时间格式。"""
 
-    hour, minute = [int(part) for part in time_text.split(":", 1)]
-    now = datetime.now()
-    next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if next_run <= now:
-        next_run += timedelta(days=1)
-    return max(1.0, (next_run - now).total_seconds())
+    try:
+        hour, minute = [int(part) for part in time_text.split(":", 1)]
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="时间格式必须为 HH:mm") from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise HTTPException(status_code=400, detail="时间格式必须为 HH:mm")
 
 
 def _time_to_minutes(time_text: str) -> int:
-    """Convert HH:mm to minutes in day."""
+    """将 HH:mm 转换成一天中的分钟数。"""
 
+    _validate_time_text(time_text)
     hour, minute = [int(part) for part in time_text.split(":", 1)]
     return hour * 60 + minute
 
 
 def _send_schedule_key(channel: str) -> str:
-    """Build scoped setting key for send schedule."""
+    """构造发送定时配置键。"""
 
     return f"send_schedule_{channel}"
 
 
-def _send_timer_key(channel: str, user_key: str) -> str:
-    """Build in-process timer key."""
+def _generate_job_id(schedule_id: str) -> str:
+    """构造定时生成 Job ID。"""
 
-    return f"{channel}::{normalize_user_key(user_key)}"
-
-
-def _cancel_schedule_timer() -> None:
-    """取消当前定时器。"""
-
-    global _schedule_timer
-    with _schedule_lock:
-        if _schedule_timer:
-            _schedule_timer.cancel()
-            _schedule_timer = None
+    return f"{GENERATE_JOB_PREFIX}{schedule_id}"
 
 
-def _cancel_send_schedule_timer(channel: str, user_key: str) -> None:
-    """Cancel one send timer."""
+def _send_job_id(channel: str, user_key: str) -> str:
+    """构造定时发送 Job ID。"""
 
-    timer_key = _send_timer_key(channel, user_key)
-    with _send_schedule_lock:
-        timer = _send_schedule_timers.pop(timer_key, None)
-        if timer:
-            timer.cancel()
+    return f"{SEND_JOB_PREFIX}{channel}::{normalize_user_key(user_key)}"
 
 
-def _validate_send_schedule(db: Session, send_time: str) -> None:
-    """Ensure send schedule is not earlier than generate schedule and generate is enabled."""
+def _normalize_schedule_item_payload(item: dict[str, Any] | ScheduleItemRequest) -> dict[str, Any]:
+    """规整单个定时生成项。"""
 
-    generate_schedule = load_json_setting(db, "schedule", default={}) or {}
-    if not generate_schedule.get("enabled"):
-        raise HTTPException(status_code=400, detail="请先开启定时生成简报，再设置定时发送。")
-    generate_time = generate_schedule.get("time") or "07:00"
-    if _time_to_minutes(generate_time) > _time_to_minutes(send_time):
-        raise HTTPException(status_code=400, detail="定时发送时间不能早于定时生成简报时间。")
-
-
-def _run_scheduled_send(channel: str, user_key: str, time_text: str) -> None:
-    """Run scheduled send and re-arm timer if still enabled."""
-
-    logger.info("定时发送触发，通道：%s，用户：%s", channel, user_key)
-    try:
-        send_existing_briefs_now(channel=channel, user_key=user_key)
-    except Exception as exc:
-        logger.error("定时发送失败：channel=%s user=%s error=%s", channel, user_key, exc, exc_info=True)
-    finally:
-        db = SessionLocal()
-        try:
-            data = load_json_setting(db, _send_schedule_key(channel), default={}, user_key=user_key) or {}
-            if data.get("enabled"):
-                _start_send_schedule_timer(channel, user_key, data.get("time", time_text))
-        finally:
-            db.close()
+    raw_item = item.model_dump() if isinstance(item, ScheduleItemRequest) else dict(item or {})
+    item_id = (raw_item.get("id") or "").strip() or f"schedule_{uuid.uuid4().hex[:12]}"
+    time_text = (raw_item.get("time") or "").strip()
+    _validate_time_text(time_text)
+    topics = _normalize_topics(raw_item.get("topics"))
+    keywords = _normalize_keywords(raw_item.get("keywords"))
+    topic_keywords = _normalize_topic_keywords(raw_item.get("topic_keywords"), topics)
+    return {
+        "id": item_id,
+        "time": time_text,
+        "topics": topics,
+        "keywords": keywords,
+        "topic_keywords": topic_keywords,
+        "enabled": bool(raw_item.get("enabled", True)),
+    }
 
 
-def _start_send_schedule_timer(channel: str, user_key: str, time_text: str) -> None:
-    """Start one send timer."""
+def _normalize_schedule_payload(payload: ScheduleRequest | dict[str, Any] | None) -> dict[str, Any]:
+    """将新旧两种定时生成配置统一规整成 items 数组结构。"""
 
-    _cancel_send_schedule_timer(channel, user_key)
-    delay = _seconds_until_run(time_text)
-    timer_key = _send_timer_key(channel, user_key)
-    with _send_schedule_lock:
-        timer = threading.Timer(delay, _run_scheduled_send, args=(channel, normalize_user_key(user_key), time_text))
-        timer.daemon = True
-        timer.start()
-        _send_schedule_timers[timer_key] = timer
-    logger.info("已开启定时发送，通道：%s，用户：%s，时间：%s", channel, user_key, time_text)
+    raw_payload = payload.model_dump() if isinstance(payload, ScheduleRequest) else dict(payload or {})
+    normalized_items: list[dict[str, Any]] = []
 
-
-def _run_scheduled_brief(
-    topics: list[str],
-    time_text: str,
-    keywords: list[str] | None = None,
-    topic_keywords: dict[str, list[str]] | None = None,
-) -> None:
-    """定时触发完整流水线。"""
-
-    logger.info(
-        "定时生成简报触发，主题：%s，关键词：%s",
-        ",".join(topics),
-        json.dumps(topic_keywords or keywords or [], ensure_ascii=False),
-    )
-    try:
-        run_all_tasks_immediately(
-            topics=topics,
-            keywords=keywords or [],
-            topic_keywords=topic_keywords or {},
+    if raw_payload.get("items"):
+        for item in raw_payload.get("items") or []:
+            normalized_items.append(_normalize_schedule_item_payload(item))
+    elif raw_payload.get("time"):
+        normalized_items.append(
+            _normalize_schedule_item_payload(
+                {
+                    "id": raw_payload.get("id"),
+                    "time": raw_payload.get("time"),
+                    "topics": raw_payload.get("topics") or [],
+                    "keywords": raw_payload.get("keywords") or [],
+                    "topic_keywords": raw_payload.get("topic_keywords") or {},
+                    "enabled": raw_payload.get("enabled", True),
+                }
+            )
         )
-    except Exception as exc:
-        logger.error("定时生成简报失败: %s", exc, exc_info=True)
-    finally:
-        db = SessionLocal()
-        try:
-            row = db.query(AppSetting).filter(AppSetting.key == "schedule").first()
-            data = json.loads(row.value) if row and row.value else {}
-            if data.get("enabled"):
-                _start_schedule_timer(
-                    data.get("time", time_text),
-                    _normalize_topics(data.get("topics")),
-                    _normalize_keywords(data.get("keywords")),
-                    _normalize_topic_keywords(data.get("topic_keywords"), data.get("topics")),
-                )
-        finally:
-            db.close()
+
+    return {
+        "enabled": bool(raw_payload.get("enabled", True)),
+        "items": normalized_items,
+    }
 
 
-def _start_schedule_timer(
-    time_text: str,
-    topics: list[str],
-    keywords: list[str] | None = None,
-    topic_keywords: dict[str, list[str]] | None = None,
-) -> None:
-    """启动定时器。"""
+def _load_schedule_value(db: Session) -> dict[str, Any]:
+    """读取并规整定时生成配置。"""
 
-    global _schedule_timer
-    _cancel_schedule_timer()
-    delay = _seconds_until_run(time_text)
-    with _schedule_lock:
-        _schedule_timer = threading.Timer(
-            delay,
-            _run_scheduled_brief,
-            args=(topics, time_text, keywords or [], topic_keywords or {}),
-        )
-        _schedule_timer.daemon = True
-        _schedule_timer.start()
-    logger.info(
-        "已开始定时生成简报，时间：%s，主题：%s，关键词：%s",
-        time_text,
-        ",".join(topics),
-        json.dumps(topic_keywords or keywords or [], ensure_ascii=False),
-    )
+    data = load_json_setting(db, GENERATE_SCHEDULE_KEY, default={}) or {}
+    return _normalize_schedule_payload(data)
 
 
-def restore_schedule_timer() -> None:
-    """后端启动时恢复定时生成配置。"""
+def _enabled_generate_items(schedule_value: dict[str, Any]) -> list[dict[str, Any]]:
+    """提取已启用的定时生成项。"""
 
-    db = SessionLocal()
-    try:
-        row = db.query(AppSetting).filter(AppSetting.key == "schedule").first()
-        data = json.loads(row.value) if row and row.value else {}
-        topics = _normalize_topics(data.get("topics"))
-        keywords = _normalize_keywords(data.get("keywords"))
-        topic_keywords = _normalize_topic_keywords(data.get("topic_keywords"), topics)
-        if data.get("enabled") and topics:
-            _start_schedule_timer(data.get("time", "07:00"), topics, keywords, topic_keywords)
-    except Exception as exc:
-        logger.error("恢复定时生成配置失败: %s", exc, exc_info=True)
-    finally:
-        db.close()
+    if not schedule_value.get("enabled"):
+        return []
+    return [item for item in schedule_value.get("items") or [] if item.get("enabled") and item.get("topics")]
 
 
-def restore_send_schedule_timers() -> None:
-    """Restore all user-scoped send schedules on startup."""
-
-    db = SessionLocal()
-    try:
-        rows = db.query(AppSetting).filter(
-            (AppSetting.key.like("send_schedule_email::user::%"))
-            | (AppSetting.key.like("send_schedule_feishu::user::%"))
-        ).all()
-        for row in rows:
-            try:
-                data = json.loads(row.value) if row.value else {}
-            except Exception:
-                continue
-            if not data.get("enabled"):
-                continue
-            channel = "email" if row.key.startswith("send_schedule_email::user::") else "feishu"
-            user_key = row.key.split("::user::", 1)[-1]
-            try:
-                _validate_send_schedule(db, data.get("time", "07:30"))
-            except HTTPException as exc:
-                logger.warning("Skip restoring send schedule for user=%s channel=%s: %s", user_key, channel, exc.detail)
-                continue
-            _start_send_schedule_timer(channel, user_key, data.get("time", "07:30"))
-    finally:
-        db.close()
-
-
-def _list_enabled_send_schedule_times(db: Session) -> list[tuple[str, str]]:
-    """Collect enabled send schedules across users."""
+def _list_enabled_send_schedules(db: Session) -> list[dict[str, Any]]:
+    """收集所有用户已启用的定时发送配置。"""
 
     rows = db.query(AppSetting).filter(
         (AppSetting.key.like("send_schedule_email::user::%"))
         | (AppSetting.key.like("send_schedule_feishu::user::%"))
     ).all()
-    items: list[tuple[str, str]] = []
+    items: list[dict[str, Any]] = []
     for row in rows:
         try:
             data = json.loads(row.value) if row.value else {}
@@ -340,8 +284,190 @@ def _list_enabled_send_schedule_times(db: Session) -> list[tuple[str, str]]:
         if not data.get("enabled"):
             continue
         channel = "email" if row.key.startswith("send_schedule_email::user::") else "feishu"
-        items.append((channel, data.get("time", "07:30")))
+        items.append(
+            {
+                "channel": channel,
+                "user_key": row.key.split("::user::", 1)[-1],
+                "time": data.get("time", "07:30"),
+                "brief_date_scopes": _normalize_brief_date_scopes(data.get("brief_date_scopes")),
+            }
+        )
     return items
+
+
+def _validate_send_schedule(db: Session, send_time: str, brief_date_scopes: list[str] | None) -> None:
+    """校验定时发送时间与定时生成时间之间的依赖关系。"""
+
+    scopes = _normalize_brief_date_scopes(brief_date_scopes)
+    if "today" not in scopes:
+        return
+
+    schedule_value = _load_schedule_value(db)
+    enabled_items = _enabled_generate_items(schedule_value)
+    if not enabled_items:
+        raise HTTPException(status_code=400, detail="请先开启至少一个定时生成任务，再发送今天的简报。")
+
+    latest_generate_minutes = max(_time_to_minutes(item["time"]) for item in enabled_items)
+    if latest_generate_minutes > _time_to_minutes(send_time):
+        raise HTTPException(status_code=400, detail="定时发送时间不能早于今天最后一个定时生成时间。")
+
+
+def _validate_schedule_against_send_schedules(db: Session, schedule_value: dict[str, Any]) -> None:
+    """校验定时生成配置不会晚于已启用的发送任务。"""
+
+    enabled_items = _enabled_generate_items(schedule_value)
+    enabled_send_schedules = _list_enabled_send_schedules(db)
+
+    if not enabled_items:
+        conflict_channels = [
+            item["channel"]
+            for item in enabled_send_schedules
+            if "today" in item["brief_date_scopes"]
+        ]
+        if conflict_channels:
+            raise HTTPException(
+                status_code=400,
+                detail="已存在发送今天简报的定时发送任务，请先关闭这些发送任务，再停用定时生成。",
+            )
+        return
+
+    latest_generate_minutes = max(_time_to_minutes(item["time"]) for item in enabled_items)
+    for send_item in enabled_send_schedules:
+        if "today" not in send_item["brief_date_scopes"]:
+            continue
+        if latest_generate_minutes > _time_to_minutes(send_item["time"]):
+            raise HTTPException(
+                status_code=400,
+                detail=f"定时生成的最晚时间不能晚于已开启的定时发送{send_item['channel']}时间（{send_item['time']}）。",
+            )
+
+
+def _upsert_generate_schedule_jobs(schedule_value: dict[str, Any]) -> None:
+    """将数据库中的定时生成配置同步到 APScheduler。"""
+
+    runtime_scheduler.remove_jobs_by_prefix(GENERATE_JOB_PREFIX)
+    for item in _enabled_generate_items(schedule_value):
+        runtime_scheduler.upsert_daily_job(
+            job_id=_generate_job_id(item["id"]),
+            func=_run_scheduled_brief,
+            time_text=item["time"],
+            args=(item["id"],),
+        )
+
+
+def _sync_send_schedule_job(channel: str, user_key: str, value: dict[str, Any]) -> None:
+    """将单个发送配置同步到 APScheduler。"""
+
+    job_id = _send_job_id(channel, user_key)
+    if not value.get("enabled"):
+        runtime_scheduler.remove_job(job_id)
+        return
+
+    runtime_scheduler.upsert_daily_job(
+        job_id=job_id,
+        func=_run_scheduled_send,
+        time_text=value["time"],
+        args=(channel, normalize_user_key(user_key)),
+    )
+
+
+def _run_scheduled_send(channel: str, user_key: str) -> None:
+    """APScheduler 触发定时发送。"""
+
+    logger.info("定时发送触发，通道：%s，用户：%s", channel, user_key)
+    db = SessionLocal()
+    try:
+        data = load_json_setting(db, _send_schedule_key(channel), default={}, user_key=user_key) or {}
+        if not data.get("enabled"):
+            return
+        send_existing_briefs_now(
+            channel=channel,
+            user_key=user_key,
+            brief_date_scopes=_normalize_brief_date_scopes(data.get("brief_date_scopes")),
+        )
+    except Exception as exc:
+        logger.error("定时发送失败：channel=%s user=%s error=%s", channel, user_key, exc, exc_info=True)
+    finally:
+        db.close()
+
+
+def _run_scheduled_brief(schedule_id: str) -> None:
+    """APScheduler 触发定时生成。"""
+
+    db = SessionLocal()
+    try:
+        schedule_value = _load_schedule_value(db)
+        if not schedule_value.get("enabled"):
+            return
+        target_item = next(
+            (
+                item
+                for item in schedule_value.get("items") or []
+                if item.get("id") == schedule_id and item.get("enabled")
+            ),
+            None,
+        )
+        if not target_item:
+            return
+
+        logger.info(
+            "定时生成简报触发，任务：%s，主题：%s，关键词：%s",
+            schedule_id,
+            ",".join(target_item.get("topics") or []),
+            json.dumps(target_item.get("topic_keywords") or target_item.get("keywords") or [], ensure_ascii=False),
+        )
+        run_all_tasks_immediately(
+            topics=target_item.get("topics") or [],
+            keywords=target_item.get("keywords") or [],
+            topic_keywords=target_item.get("topic_keywords") or {},
+        )
+    except Exception as exc:
+        logger.error("定时生成简报失败：schedule_id=%s error=%s", schedule_id, exc, exc_info=True)
+    finally:
+        db.close()
+
+
+def restore_schedule_timer() -> None:
+    """应用启动时恢复定时生成任务。"""
+
+    db = SessionLocal()
+    try:
+        schedule_value = _load_schedule_value(db)
+        _upsert_generate_schedule_jobs(schedule_value)
+    except Exception as exc:
+        logger.error("恢复定时生成配置失败: %s", exc, exc_info=True)
+    finally:
+        db.close()
+
+
+def restore_send_schedule_timers() -> None:
+    """应用启动时恢复定时发送任务。"""
+
+    runtime_scheduler.remove_jobs_by_prefix(SEND_JOB_PREFIX)
+    db = SessionLocal()
+    try:
+        for item in _list_enabled_send_schedules(db):
+            try:
+                _validate_send_schedule(db, item["time"], item["brief_date_scopes"])
+            except HTTPException as exc:
+                logger.warning(
+                    "跳过恢复定时发送，用户=%s 通道=%s 原因=%s",
+                    item["user_key"],
+                    item["channel"],
+                    exc.detail,
+                )
+                continue
+            _sync_send_schedule_job(
+                channel=item["channel"],
+                user_key=item["user_key"],
+                value={
+                    "time": item["time"],
+                    "enabled": True,
+                    "brief_date_scopes": item["brief_date_scopes"],
+                },
+            )
+    finally:
+        db.close()
 
 
 def _submit_task(task, background_tasks: BackgroundTasks, *args, **kwargs):
@@ -378,7 +504,7 @@ def trigger_generate_brief(
     payload: GenerateBriefRequest | None = None,
     db: Session = Depends(get_db),
 ):
-    """一键生成当天简报。"""
+    """一键生成当日简报。"""
 
     user_key = _request_user_key(request)
     selected_topics = _normalize_topics(payload.topics if payload else [])
@@ -413,41 +539,23 @@ def trigger_generate_brief(
 
 @router.post("/schedule")
 def save_schedule(payload: ScheduleRequest, db: Session = Depends(get_db)):
-    """保存定时生成配置。"""
+    """保存多时间段定时生成配置。"""
 
-    selected_topics = _normalize_topics(payload.topics)
-    selected_keywords = _normalize_keywords(payload.keywords)
-    selected_topic_keywords = _normalize_topic_keywords(payload.topic_keywords, selected_topics)
-    if payload.enabled and not selected_topics:
-        raise HTTPException(status_code=400, detail="请至少选择一个主题")
-    try:
-        _seconds_until_run(payload.time)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="定时时间格式必须为 HH:mm") from exc
+    schedule_value = _normalize_schedule_payload(payload)
+    enabled_items = _enabled_generate_items(schedule_value)
+    if schedule_value.get("enabled") and not enabled_items:
+        raise HTTPException(status_code=400, detail="请至少配置一个已启用的定时生成项")
 
-    enabled_send_schedules = _list_enabled_send_schedule_times(db)
-    if not payload.enabled and enabled_send_schedules:
-        raise HTTPException(status_code=400, detail="已有定时发送任务开启，请先关闭定时发送，再关闭定时生成简报。")
-    for channel_name, send_time in enabled_send_schedules:
-        if payload.enabled and _time_to_minutes(payload.time) > _time_to_minutes(send_time):
-            raise HTTPException(
-                status_code=400,
-                detail=f"定时生成简报时间不能晚于已开启的定时发送{channel_name}时间（{send_time}）。",
-            )
+    _validate_schedule_against_send_schedules(db, schedule_value)
 
-    value = payload.model_dump()
-    value["topics"] = selected_topics
-    value["keywords"] = selected_keywords
-    value["topic_keywords"] = selected_topic_keywords
-    _upsert_setting(db, "schedule", value)
+    _upsert_setting(db, GENERATE_SCHEDULE_KEY, schedule_value)
     db.commit()
+    _upsert_generate_schedule_jobs(schedule_value)
 
-    if payload.enabled:
-        _start_schedule_timer(payload.time, selected_topics, selected_keywords, selected_topic_keywords)
-        return ok(value, "schedule started")
-
-    _cancel_schedule_timer()
-    return ok(value, "schedule stopped")
+    return ok(
+        schedule_value,
+        "schedule started" if enabled_items else "schedule stopped",
+    )
 
 
 @router.post("/send-schedule")
@@ -455,23 +563,26 @@ def save_send_schedule(request: Request, payload: SendScheduleRequest, db: Sessi
     """保存定时发送配置。"""
 
     channel = (payload.channel or "").strip().lower()
-    if channel not in {"email", "feishu"}:
+    if channel not in SEND_CHANNELS:
         raise HTTPException(status_code=400, detail="channel 只支持 email 或 feishu")
-    try:
-        _seconds_until_run(payload.time)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="定时发送时间格式必须为 HH:mm") from exc
 
+    _validate_time_text(payload.time)
     user_key = _request_user_key(request)
-    value = {"channel": channel, "time": payload.time, "enabled": bool(payload.enabled)}
+    brief_date_scopes = _normalize_brief_date_scopes(payload.brief_date_scopes)
+    value = {
+        "channel": channel,
+        "time": payload.time,
+        "enabled": bool(payload.enabled),
+        "brief_date_scopes": brief_date_scopes,
+    }
+
     if payload.enabled:
-        _validate_send_schedule(db, payload.time)
-        _start_send_schedule_timer(channel, user_key, payload.time)
-    else:
-        _cancel_send_schedule_timer(channel, user_key)
+        _validate_send_schedule(db, payload.time, brief_date_scopes)
 
     save_json_setting(db, _send_schedule_key(channel), value, user_key=user_key)
     db.commit()
+    _sync_send_schedule_job(channel, user_key, value)
+
     return ok(value, "send schedule started" if payload.enabled else "send schedule stopped")
 
 
@@ -484,12 +595,26 @@ def trigger_run_all(background_tasks: BackgroundTasks):
 
 
 @router.post("/send-now")
-def trigger_send_now(request: Request, payload: SendNowRequest):
-    """按当前发送设置立即补发当天简报。"""
+def trigger_send_now(request: Request, payload: SendNowRequest, db: Session = Depends(get_db)):
+    """按当前发送设置立即发送简报。"""
 
     channel = (payload.channel or "").strip().lower()
-    if channel not in {"email", "feishu"}:
+    if channel not in SEND_CHANNELS:
         raise HTTPException(status_code=400, detail="channel 只支持 email 或 feishu")
+
     user_key = _request_user_key(request)
-    result = send_existing_briefs_now(channel=channel, user_key=user_key)
+    brief_date_scopes = _normalize_brief_date_scopes(payload.brief_date_scopes)
+
+    # 如果前端没有显式传递范围，则回退到该渠道已保存的发送设置。
+    if not payload.brief_date_scopes:
+        saved_value = load_json_setting(db, _send_schedule_key(channel), default={}, user_key=user_key) or {}
+        brief_date_scopes = _normalize_brief_date_scopes(saved_value.get("brief_date_scopes"))
+
+    result = send_existing_briefs_now(
+        channel=channel,
+        user_key=user_key,
+        brief_date_scopes=brief_date_scopes,
+    )
+    result["brief_date_scopes"] = brief_date_scopes
+    result["target_dates"] = [item.isoformat() for item in _resolve_target_brief_dates(brief_date_scopes)]
     return ok(result, result.get("message", "send completed"))

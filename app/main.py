@@ -13,6 +13,7 @@ from app.api import briefs, settings, sources, tasks, weather
 from app.api.response import fail
 from app.config import settings as app_settings
 from app.database import Base, engine, ensure_postgres_schema_updates, ensure_sqlite_schema
+from app.modules.scheduler import runtime_scheduler
 import app.models  # noqa: F401  # 导入全部模型，确保建表完整
 
 logging.basicConfig(
@@ -74,8 +75,22 @@ app.include_router(briefs.router)
 app.include_router(tasks.router)
 app.include_router(settings.router)
 app.include_router(weather.router)
-tasks.restore_schedule_timer()
-tasks.restore_send_schedule_timers()
+
+
+@app.on_event("startup")
+def startup_runtime_scheduler() -> None:
+    """启动应用时恢复 APScheduler 定时任务。"""
+
+    runtime_scheduler.start()
+    tasks.restore_schedule_timer()
+    tasks.restore_send_schedule_timers()
+
+
+@app.on_event("shutdown")
+def shutdown_runtime_scheduler() -> None:
+    """关闭应用时停止 APScheduler。"""
+
+    runtime_scheduler.shutdown()
 
 
 @app.get("/")

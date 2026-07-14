@@ -28,10 +28,8 @@ export const state = reactive({
     },
   },
   schedule: {
-    time: "07:00",
     enabled: false,
-    topics: [],
-    topic_keywords: {},
+    items: [],
   },
   weather: {
     region: "北京",

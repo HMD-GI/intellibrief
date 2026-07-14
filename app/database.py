@@ -50,6 +50,32 @@ def ensure_postgres_schema_updates():
     ddl_list = [
         "ALTER TABLE briefs ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE briefs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP NULL",
+        """
+        DO $$
+        DECLARE
+            constraint_name text;
+        BEGIN
+            -- 历史版本曾经可能给 briefs.date 加过唯一约束；现在同一天允许按主题和关键词生成多份简报。
+            FOR constraint_name IN
+                SELECT con.conname
+                FROM pg_constraint con
+                JOIN pg_class rel ON rel.oid = con.conrelid
+                JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+                WHERE rel.relname = 'briefs'
+                  AND nsp.nspname = current_schema()
+                  AND con.contype = 'u'
+                  AND array_length(con.conkey, 1) = 1
+                  AND (
+                      SELECT att.attname
+                      FROM pg_attribute att
+                      WHERE att.attrelid = rel.oid
+                        AND att.attnum = con.conkey[1]
+                  ) = 'date'
+            LOOP
+                EXECUTE format('ALTER TABLE briefs DROP CONSTRAINT IF EXISTS %I', constraint_name);
+            END LOOP;
+        END $$;
+        """,
     ]
     with engine.begin() as conn:
         for ddl in ddl_list:

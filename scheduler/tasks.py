@@ -3,7 +3,7 @@ import hashlib
 import json
 import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from urllib.parse import urlparse
 
 import requests
@@ -791,26 +791,50 @@ def run_all_tasks_immediately(
             logger.error(str(exc))
             return {"message": str(exc), "run_ids": run_ids}
         logger.error("❌ Error in immediate execution pipeline: %s", exc, exc_info=True)
-def send_existing_briefs_now(channel: str, user_key: str | None = None) -> dict[str, object]:
-    """按指定通道立即发送当天已生成的简报和天气信息。
+def send_existing_briefs_now(
+    channel: str,
+    user_key: str | None = None,
+    brief_date_scopes: list[str] | None = None,
+) -> dict[str, object]:
+    """按指定通道立即发送目标日期范围内的简报和天气信息。
 
     技术说明：
-    1. 无论当天生成了多少份简报，都只发一条飞书消息或一封邮件。
-    2. 简报部分统一采用摘要播报格式：标题、主题、日期、链接。
-    3. 这样多主题场景下不会出现连续多条通知，阅读成本更低。
+    1. 这里支持 today / yesterday 两种相对日期，便于把多天简报合并成一条飞书消息或一封邮件。
+    2. 简报仍只发送未软删除记录，避免把旧版本或已删除简报再次发出去。
+    3. 天气和台风继续按“当前当天”获取，因为这部分信息属于即时播报，不按历史日期回放。
     """
+
+    normalized_scopes: list[str] = []
+    for scope in brief_date_scopes or []:
+        clean_scope = (scope or "").strip().lower()
+        if clean_scope in {"today", "yesterday"} and clean_scope not in normalized_scopes:
+            normalized_scopes.append(clean_scope)
+    if not normalized_scopes:
+        normalized_scopes = ["today"]
+
+    target_dates: list[date] = []
+    for scope in normalized_scopes:
+        if scope == "today":
+            target_dates.append(date.today())
+        elif scope == "yesterday":
+            target_dates.append(date.today() - timedelta(days=1))
 
     bindings = load_binding_settings(user_key=user_key)
     db = SessionLocal()
     try:
         briefs = (
             db.query(Brief)
-            .filter(Brief.date == date.today(), Brief.is_deleted == False)
-            .order_by(Brief.generated_at.desc())
+            .filter(Brief.date.in_(target_dates), Brief.is_deleted == False)
+            .order_by(Brief.date.desc(), Brief.generated_at.desc())
             .all()
         )
         if not briefs:
-            return {"sent_count": 0, "message": "当天没有可发送的简报"}
+            return {
+                "sent_count": 0,
+                "message": "目标日期范围内没有可发送的简报",
+                "brief_date_scopes": normalized_scopes,
+                "target_dates": [item.isoformat() for item in target_dates],
+            }
 
         weather_report = None
         if should_fetch_weather(bindings):
@@ -823,9 +847,9 @@ def send_existing_briefs_now(channel: str, user_key: str | None = None) -> dict[
 
         # 这里统一使用可公网访问的基地址拼接简报链接。
         # 技术原理：
-        # 1. 通知消息属于站外访问场景，客户端点击时会从飞书或邮箱直接打开链接。
-        # 2. 如果继续写死 localhost，链接只对服务器本机有效，外部用户无法访问。
-        # 3. 因此这里改为读取 PUBLIC_BASE_URL，并回退到 FRONTEND_ORIGINS 中的非本地地址。
+        # 1. 飞书和邮箱消息属于站外访问场景，客户端会直接打开该链接。
+        # 2. 如果继续使用 localhost，链接只对服务器本机有效，外部用户无法访问。
+        # 3. 因此这里优先读取 PUBLIC_BASE_URL，并在未配置时回退到非本地 FRONTEND_ORIGINS。
         public_base_url = settings.normalized_public_base_url
 
         brief_payloads = [
@@ -838,9 +862,12 @@ def send_existing_briefs_now(channel: str, user_key: str | None = None) -> dict[
             for brief in briefs
         ]
 
+        # 这里统一使用本次发送简报中的最新日期作为通知主日期，便于消息标题表达“最新一批简报”。
+        primary_brief_date = max(brief.date for brief in briefs)
+
         if channel == "email":
             send_email(
-                brief_date=briefs[0].date if briefs else date.today(),
+                brief_date=primary_brief_date,
                 weather_report=weather_report,
                 user_key=user_key,
                 briefs=brief_payloads,
@@ -848,7 +875,7 @@ def send_existing_briefs_now(channel: str, user_key: str | None = None) -> dict[
             sent_count = 1
         else:
             send_feishu_robot_card(
-                brief_date=briefs[0].date if briefs else date.today(),
+                brief_date=primary_brief_date,
                 weather_report=weather_report,
                 user_key=user_key,
                 briefs=brief_payloads,
@@ -856,7 +883,11 @@ def send_existing_briefs_now(channel: str, user_key: str | None = None) -> dict[
             sent_count = 1
 
         channel_label = "邮箱" if channel == "email" else "飞书"
-        return {"sent_count": sent_count, "message": f"已发送 1 条包含 {len(brief_payloads)} 份简报的{channel_label}通知"}
+        return {
+            "sent_count": sent_count,
+            "message": f"已发送 1 条包含 {len(brief_payloads)} 份简报的{channel_label}通知",
+            "brief_date_scopes": normalized_scopes,
+            "target_dates": [item.isoformat() for item in target_dates],
+        }
     finally:
         db.close()
-

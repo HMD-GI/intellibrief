@@ -107,23 +107,48 @@
               {{ isGenerating ? "正在生成中" : "一键生成当日简报" }}
             </button>
             <div class="schedule-row">
-              <input v-model="scheduleForm.time" type="time">
-              <button type="button" class="secondary-btn" @click="handleToggleSchedule">
-                {{ scheduleForm.enabled ? "已开启定时生成简报" : "开始定时生成简报" }}
+              <button type="button" class="secondary-btn" @click="handleAddScheduleItem">
+                添加当前选择为定时项
+              </button>
+              <button type="button" class="secondary-btn" @click="handleSaveSchedule(true)">
+                {{ scheduleForm.enabled ? "保存定时生成配置" : "保存并开启定时生成简报" }}
+              </button>
+              <button
+                v-if="scheduleForm.enabled"
+                type="button"
+                class="secondary-btn"
+                @click="handleSaveSchedule(false)"
+              >
+                停止定时生成简报
               </button>
             </div>
-            <div v-if="scheduleForm.enabled" class="schedule-topic">
-              <div>定时主题：{{ scheduleForm.topics.join("、") || "-" }}</div>
-              <div v-if="Object.keys(scheduleForm.topic_keywords || {}).length">
-                定时关键词：
+            <div class="schedule-topic">
+              <div v-if="!scheduleForm.items.length">暂无定时生成项，请先选择主题后添加。</div>
+              <div v-else class="schedule-item-list">
                 <div
-                  v-for="topic in scheduleForm.topics"
-                  :key="`schedule-${topic}`"
+                  v-for="item in scheduleForm.items"
+                  :key="item.id"
+                  class="schedule-item"
                 >
-                  {{ topic }}：{{ (scheduleForm.topic_keywords?.[topic] || []).join("、") || "未设置" }}
+                  <div class="schedule-row">
+                    <input v-model="item.time" type="time">
+                    <label class="check-row">
+                      <input v-model="item.enabled" type="checkbox">
+                      启用该时间段
+                    </label>
+                    <button type="button" class="secondary-btn" @click="handleReplaceScheduleItem(item)">
+                      用当前选择覆盖
+                    </button>
+                    <button type="button" class="link-btn" @click="handleRemoveScheduleItem(item.id)">
+                      删除
+                    </button>
+                  </div>
+                  <div>主题：{{ item.topics.join("、") || "-" }}</div>
+                  <div>关键词：{{ formatScheduleItemKeywords(item) }}</div>
                 </div>
               </div>
-              <div v-else>定时关键词：未设置</div>
+              <div v-if="scheduleForm.enabled">当前状态：已开启多时间段定时生成</div>
+              <div v-else>当前状态：未开启定时生成</div>
             </div>
           </section>
         </div>
@@ -230,8 +255,30 @@
                 {{ sendNowLoading.email ? "发送中" : "一键发送邮箱" }}
               </button>
               <input v-model="sendScheduleForm.email.time" type="time">
-              <button type="button" class="secondary-btn" @click="handleToggleSendSchedule('email')">
-                {{ sendScheduleForm.email.enabled ? "已开启定时发送邮箱" : "开始定时发送邮箱" }}
+              <div class="scope-options">
+                <label
+                  v-for="scope in BRIEF_DATE_SCOPE_OPTIONS"
+                  :key="`email-${scope.value}`"
+                  class="check-row"
+                >
+                  <input
+                    :checked="sendScheduleForm.email.brief_date_scopes.includes(scope.value)"
+                    type="checkbox"
+                    @change="toggleBriefDateScope('email', scope.value)"
+                  >
+                  {{ scope.label }}
+                </label>
+              </div>
+              <button type="button" class="secondary-btn" @click="handleSaveSendSchedule('email', true)">
+                {{ sendScheduleForm.email.enabled ? "保存定时发送邮箱" : "开启定时发送邮箱" }}
+              </button>
+              <button
+                v-if="sendScheduleForm.email.enabled"
+                type="button"
+                class="secondary-btn"
+                @click="handleSaveSendSchedule('email', false)"
+              >
+                停止定时发送邮箱
               </button>
             </div>
           </section>
@@ -273,8 +320,30 @@
                 {{ sendNowLoading.feishu ? "发送中" : "一键发送飞书" }}
               </button>
               <input v-model="sendScheduleForm.feishu.time" type="time">
-              <button type="button" class="secondary-btn" @click="handleToggleSendSchedule('feishu')">
-                {{ sendScheduleForm.feishu.enabled ? "已开启定时发送飞书" : "开始定时发送飞书" }}
+              <div class="scope-options">
+                <label
+                  v-for="scope in BRIEF_DATE_SCOPE_OPTIONS"
+                  :key="`feishu-${scope.value}`"
+                  class="check-row"
+                >
+                  <input
+                    :checked="sendScheduleForm.feishu.brief_date_scopes.includes(scope.value)"
+                    type="checkbox"
+                    @change="toggleBriefDateScope('feishu', scope.value)"
+                  >
+                  {{ scope.label }}
+                </label>
+              </div>
+              <button type="button" class="secondary-btn" @click="handleSaveSendSchedule('feishu', true)">
+                {{ sendScheduleForm.feishu.enabled ? "保存定时发送飞书" : "开启定时发送飞书" }}
+              </button>
+              <button
+                v-if="sendScheduleForm.feishu.enabled"
+                type="button"
+                class="secondary-btn"
+                @click="handleSaveSendSchedule('feishu', false)"
+              >
+                停止定时发送飞书
               </button>
             </div>
           </section>
@@ -313,6 +382,10 @@ import WeatherPanel from "./modules/weather/components/WeatherPanel.vue";
 import { setView, state, toggleTopic, TOPICS } from "./state";
 
 const USER_KEY_STORAGE = "intellibrief_user_key";
+const BRIEF_DATE_SCOPE_OPTIONS = [
+  { label: "今天", value: "today" },
+  { label: "昨天", value: "yesterday" },
+];
 
 const toastMessage = ref("");
 const isGenerating = ref(false);
@@ -335,20 +408,20 @@ const filters = reactive({
 });
 
 const scheduleForm = reactive({
-  time: "07:00",
   enabled: false,
-  topics: [],
-  topic_keywords: {},
+  items: [],
 });
 
 const sendScheduleForm = reactive({
   email: {
     time: "07:30",
     enabled: false,
+    brief_date_scopes: ["today"],
   },
   feishu: {
     time: "07:30",
     enabled: false,
+    brief_date_scopes: ["today"],
   },
 });
 
@@ -412,6 +485,78 @@ function buildTopicKeywordMap(topics) {
     }
   });
   return result;
+}
+
+function createScheduleItemFromCurrentSelection() {
+  // 以“当前工作台勾选的主题和关键词”生成一条新的定时生成项。
+  const now = Date.now().toString(36);
+  const lastItem = scheduleForm.items[scheduleForm.items.length - 1];
+  return {
+    id: `schedule_${now}_${Math.random().toString(36).slice(2, 8)}`,
+    time: lastItem?.time || "07:00",
+    topics: [...state.topics],
+    keywords: [],
+    topic_keywords: buildTopicKeywordMap(state.topics),
+    enabled: true,
+  };
+}
+
+function normalizeScheduleItems(items) {
+  // 统一规整后端返回的定时项结构，兼容旧版单 time 配置和新版 items 数组配置。
+  if (Array.isArray(items) && items.length) {
+    return items.map((item, index) => ({
+      id: item.id || `schedule_${index + 1}`,
+      time: item.time || "07:00",
+      topics: item.topics || [],
+      keywords: item.keywords || [],
+      topic_keywords: item.topic_keywords || {},
+      enabled: item.enabled !== false,
+    }));
+  }
+  return [];
+}
+
+function assignScheduleValue(value) {
+  // 将后端的定时生成配置完整回填到前端状态。
+  const items = normalizeScheduleItems(value?.items);
+  scheduleForm.enabled = !!value?.enabled;
+  scheduleForm.items.splice(0, scheduleForm.items.length, ...items);
+  state.schedule = {
+    enabled: scheduleForm.enabled,
+    items: items.map((item) => ({
+      id: item.id,
+      time: item.time,
+      topics: [...item.topics],
+      keywords: [...(item.keywords || [])],
+      topic_keywords: { ...(item.topic_keywords || {}) },
+      enabled: item.enabled !== false,
+    })),
+  };
+}
+
+function formatScheduleItemKeywords(item) {
+  // 将定时项中的主题关键词转成便于展示的文本。
+  const entries = Object.entries(item?.topic_keywords || {});
+  if (!entries.length) {
+    return "未设置";
+  }
+  return entries
+    .map(([topic, keywords]) => `${topic}：${(keywords || []).join("、") || "未设置"}`)
+    .join("；");
+}
+
+function toggleBriefDateScope(channel, scope) {
+  // 控制定时发送中的 today / yesterday 多选。
+  const values = sendScheduleForm[channel].brief_date_scopes;
+  const index = values.indexOf(scope);
+  if (index >= 0) {
+    values.splice(index, 1);
+  } else {
+    values.push(scope);
+  }
+  if (!values.length) {
+    values.push("today");
+  }
 }
 
 function applyTopicKeywordsToInputs(topicKeywords) {
@@ -494,17 +639,24 @@ async function loadSchedule() {
   try {
     const data = await getSetting("schedule");
     const value = data?.value || {};
-    scheduleForm.time = value.time || "07:00";
-    scheduleForm.enabled = !!value.enabled;
-    scheduleForm.topics = value.topics || [];
-    scheduleForm.topic_keywords = value.topic_keywords || {};
-    state.schedule = {
-      time: scheduleForm.time,
-      enabled: scheduleForm.enabled,
-      topics: [...scheduleForm.topics],
-      topic_keywords: { ...scheduleForm.topic_keywords },
-    };
-    applyTopicKeywordsToInputs(scheduleForm.topic_keywords);
+    // 兼容旧版单时间配置，自动转成新版多时间段结构。
+    if (!value.items && value.time) {
+      value.items = [
+        {
+          id: "legacy_schedule",
+          time: value.time,
+          topics: value.topics || [],
+          keywords: value.keywords || [],
+          topic_keywords: value.topic_keywords || {},
+          enabled: value.enabled !== false,
+        },
+      ];
+    }
+    assignScheduleValue(value);
+    const firstItem = scheduleForm.items[0];
+    if (firstItem) {
+      applyTopicKeywordsToInputs(firstItem.topic_keywords);
+    }
   } catch (error) {
     showToast(`加载定时设置失败：${error.message}`);
   }
@@ -520,8 +672,10 @@ async function loadSendSchedules() {
     const feishuValue = feishuData?.value || {};
     sendScheduleForm.email.time = emailValue.time || "07:30";
     sendScheduleForm.email.enabled = !!emailValue.enabled;
+    sendScheduleForm.email.brief_date_scopes = emailValue.brief_date_scopes || ["today"];
     sendScheduleForm.feishu.time = feishuValue.time || "07:30";
     sendScheduleForm.feishu.enabled = !!feishuValue.enabled;
+    sendScheduleForm.feishu.brief_date_scopes = feishuValue.brief_date_scopes || ["today"];
   } catch (error) {
     showToast(`加载定时发送设置失败：${error.message}`);
   }
@@ -571,34 +725,63 @@ async function handleGenerate() {
   }
 }
 
-async function handleToggleSchedule() {
-  if (!scheduleForm.enabled && !state.topics.length) {
-    showToast("请至少选择一个主题");
+function handleAddScheduleItem() {
+  // 将当前工作台选择的主题和关键词快照加入定时列表，供 APScheduler 后续恢复和触发。
+  if (!state.topics.length) {
+    showToast("请先选择至少一个主题，再添加定时项");
     return;
   }
+  scheduleForm.items.push(createScheduleItemFromCurrentSelection());
+  showToast("已添加一条定时生成项");
+}
 
-  const nextEnabled = !scheduleForm.enabled;
-  const topics = nextEnabled ? [...state.topics] : scheduleForm.topics;
+function handleReplaceScheduleItem(item) {
+  // 用当前工作台选择覆盖某一条定时项，避免在列表里重复填写主题和关键词。
+  if (!state.topics.length) {
+    showToast("请先选择至少一个主题，再覆盖定时项");
+    return;
+  }
+  item.topics = [...state.topics];
+  item.keywords = [];
+  item.topic_keywords = buildTopicKeywordMap(state.topics);
+  showToast("定时项已更新为当前主题配置");
+}
+
+function handleRemoveScheduleItem(scheduleId) {
+  // 删除指定定时生成项。
+  const index = scheduleForm.items.findIndex((item) => item.id === scheduleId);
+  if (index >= 0) {
+    scheduleForm.items.splice(index, 1);
+    showToast("已删除定时生成项");
+  }
+}
+
+async function handleSaveSchedule(enabled) {
+  // 保存多时间段定时生成配置，并同步开启或关闭 APScheduler 任务。
+  if (enabled && !scheduleForm.items.length) {
+    if (!state.topics.length) {
+      showToast("请至少选择一个主题并添加一条定时项");
+      return;
+    }
+    scheduleForm.items.push(createScheduleItemFromCurrentSelection());
+  }
+
   const payload = {
-    time: scheduleForm.time,
-    topics,
-    enabled: nextEnabled,
-    topic_keywords: buildTopicKeywordMap(topics),
+    enabled,
+    items: scheduleForm.items.map((item) => ({
+      id: item.id,
+      time: item.time,
+      topics: item.topics || [],
+      keywords: item.keywords || [],
+      topic_keywords: item.topic_keywords || {},
+      enabled: item.enabled !== false,
+    })),
   };
 
   try {
     const value = await saveSchedule(payload);
-    scheduleForm.enabled = !!value.enabled;
-    scheduleForm.topics = value.topics || [];
-    scheduleForm.topic_keywords = value.topic_keywords || {};
-    state.schedule = {
-      time: value.time || scheduleForm.time,
-      enabled: scheduleForm.enabled,
-      topics: [...scheduleForm.topics],
-      topic_keywords: { ...scheduleForm.topic_keywords },
-    };
-    applyTopicKeywordsToInputs(scheduleForm.topic_keywords);
-    showToast(scheduleForm.enabled ? "已开启定时生成简报" : "已取消定时生成简报");
+    assignScheduleValue(value);
+    showToast(enabled ? "已保存并开启定时生成简报" : "已关闭定时生成简报");
   } catch (error) {
     showToast(`保存定时设置失败：${error.message}`);
   }
@@ -607,7 +790,10 @@ async function handleToggleSchedule() {
 async function handleSendNow(channel) {
   sendNowLoading[channel] = true;
   try {
-    const result = await sendNow({ channel });
+    const result = await sendNow({
+      channel,
+      brief_date_scopes: [...sendScheduleForm[channel].brief_date_scopes],
+    });
     showToast(result?.message || "发送完成");
   } catch (error) {
     showToast(`发送失败：${error.message}`);
@@ -616,18 +802,20 @@ async function handleSendNow(channel) {
   }
 }
 
-async function handleToggleSendSchedule(channel) {
-  const nextEnabled = !sendScheduleForm[channel].enabled;
+async function handleSaveSendSchedule(channel, enabled) {
+  // 保存单个渠道的定时发送配置，并把“今天/昨天”多选一起提交给后端。
   try {
     const value = await saveSendSchedule({
       channel,
       time: sendScheduleForm[channel].time,
-      enabled: nextEnabled,
+      enabled,
+      brief_date_scopes: [...sendScheduleForm[channel].brief_date_scopes],
     });
     sendScheduleForm[channel].time = value.time || sendScheduleForm[channel].time;
     sendScheduleForm[channel].enabled = !!value.enabled;
+    sendScheduleForm[channel].brief_date_scopes = value.brief_date_scopes || ["today"];
     showToast(
-      sendScheduleForm[channel].enabled
+      enabled
         ? `已开启定时发送${channel === "email" ? "邮箱" : "飞书"}`
         : `已取消定时发送${channel === "email" ? "邮箱" : "飞书"}`,
     );
