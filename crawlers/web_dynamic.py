@@ -49,6 +49,66 @@ def _is_valid_article_url(url: str, config: dict) -> bool:  # 判断列表链接
     return bool(re.fullmatch(article_id_regex, article_id))
 
 class DynamicCrawler(BaseCrawler):  # 动态网页爬虫类
+    async def _launch_browser(self, playwright, config: dict):
+        """按优先级启动浏览器。
+
+        技术说明：
+        1. 服务器环境不一定安装系统 Chrome，因此不能把 `channel="chrome"` 作为唯一方案。
+        2. 先尝试系统 Chrome，可以复用真实浏览器特征，降低个别站点的兼容问题。
+        3. 若系统 Chrome 不存在，则自动回退到 Playwright 自带 Chromium，提升云服务器可用性。
+        4. `--no-sandbox` 和 `--disable-dev-shm-usage` 是 Linux 云主机常见稳定性参数，可减少权限和共享内存问题。
+        """
+
+        headless = bool(config.get("headless", True))
+        launch_args = config.get("launch_args") or [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+        ]
+
+        browser_channel = (config.get("browser_channel") or "chrome").strip()
+        prefer_system_browser = bool(config.get("prefer_system_browser", True))
+
+        launch_attempts = []
+        if prefer_system_browser and browser_channel:
+            launch_attempts.append(
+                {
+                    "name": f"system-{browser_channel}",
+                    "kwargs": {
+                        "headless": headless,
+                        "channel": browser_channel,
+                        "args": launch_args,
+                    },
+                }
+            )
+
+        launch_attempts.append(
+            {
+                "name": "playwright-chromium",
+                "kwargs": {
+                    "headless": headless,
+                    "args": launch_args,
+                },
+            }
+        )
+
+        last_error = None
+        for attempt in launch_attempts:
+            try:
+                browser = await playwright.chromium.launch(**attempt["kwargs"])
+                logger.info("Dynamic crawler browser launched with mode=%s", attempt["name"])
+                return browser
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Dynamic crawler browser launch failed for mode=%s: %s", attempt["name"], exc)
+
+        logger.error(
+            "Failed to launch any Chromium browser. "
+            "Please install Google Chrome or run 'playwright install chromium'. error=%s",
+            last_error,
+        )
+        return None
+
     def fetch(self) -> List[RawArticle]:  # 暴露给 Celery 调用的同步方法
         # 因为 Playwright 是异步的，需要用 asyncio.run 运行它
         try:  # 开启异常捕获
@@ -81,15 +141,8 @@ class DynamicCrawler(BaseCrawler):  # 动态网页爬虫类
             return results  # 返回空列表
 
         async with async_playwright() as p:  # 异步启动 Playwright 实例
-            # 尝试连接本地 Chrome
-            try:
-                browser = await p.chromium.launch(
-                    # 默认使用无头模式，避免生成国外新闻时弹出可见浏览器窗口。
-                    headless=bool(config.get("headless", True)),
-                    channel="chrome" # 指定使用系统自带的 Chrome 浏览器
-                )
-            except Exception as e:
-                logger.error(f"Failed to launch built-in Chrome, please ensure Chrome is installed: {e}")
+            browser = await self._launch_browser(p, config)
+            if browser is None:
                 return results
 
             context = await browser.new_context(
